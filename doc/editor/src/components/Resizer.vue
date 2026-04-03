@@ -12,10 +12,13 @@ const props = withDefaults(defineProps<{
   minRight?: number
   /** 容器选择器，默认 .main-layout */
   containerSelector?: string
+  /** 左侧固定面板宽度（如文件列表） */
+  leftFixedWidth?: number
 }>(), {
   minLeft: 180,
   minRight: 200,
   containerSelector: '.main-layout',
+  leftFixedWidth: 0,
 })
 
 const resizer = ref<HTMLDivElement>()
@@ -52,8 +55,9 @@ function onMouseMove(e: MouseEvent) {
   if (!leftPanel || !rightPanel) return
 
   const dx = e.clientX - startX
-  const newLeft = Math.max(props.minLeft, Math.min(startLeftWidth + dx, containerWidth - props.minRight - 8))
-  const newRight = containerWidth - 8 - newLeft // 8 = 两个 resizer 的宽度
+  const maxLeftWidth = containerWidth - props.minRight - props.leftFixedWidth - 4 // 4 = resizer 宽度
+  const newLeft = Math.max(props.minLeft, Math.min(startLeftWidth + dx, maxLeftWidth))
+  const newRight = containerWidth - props.leftFixedWidth - 4 - newLeft // 4 = resizer 宽度
 
   leftPanel.style.width = newLeft + 'px'
   leftPanel.style.flex = 'none'

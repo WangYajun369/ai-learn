@@ -130,7 +130,8 @@ function handleCopied() {
         left-selector=".panel-editor"
         right-selector=".panel-preview"
         :min-left="250"
-        :min-right="250"
+        :min-right="410"
+        :left-fixed-width="220"
         container-selector=".main-layout"
       />
 
