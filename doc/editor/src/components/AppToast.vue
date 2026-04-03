@@ -1,17 +1,17 @@
 <script setup lang="ts">
 import { ref, onUnmounted } from 'vue'
-
 const props = withDefaults(defineProps<{
   msg: string
   duration?: number
 }>(), {
   duration: 2500,
 })
-
 const visible = ref(false)
+const currentMsg = ref(props.msg)
 let timer: ReturnType<typeof setTimeout> | undefined = undefined
 
 function show(_msg?: string) {
+  currentMsg.value = _msg || ''
   visible.value = true
   if (timer) clearTimeout(timer)
   timer = setTimeout(() => {
@@ -26,7 +26,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="toast" :class="{ show: visible }">{{ msg }}</div>
+  <div class="toast" :class="{ show: visible }">{{ currentMsg }}</div>
 </template>
 
 <style scoped>

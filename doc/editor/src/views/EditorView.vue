@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
+import {onMounted, ref, computed, onBeforeUnmount} from 'vue'
 import { useEditorStore } from '../stores/editor'
 import { storeToRefs } from 'pinia'
 import Toolbar from '../components/Toolbar.vue'
@@ -10,6 +10,9 @@ import Resizer from '../components/Resizer.vue'
 const store = useEditorStore()
 const toast = ref<InstanceType<typeof AppToast>>()
 const { editContent, originalHtml } = storeToRefs(store)
+
+// File System Access API: 保存目录的 handle
+const saveDirHandle = ref<FileSystemDirectoryHandle | null>(null)
 
 // 预览 HTML（处理 body 样式适配）
 const previewHtml = computed(() => {
@@ -49,14 +52,197 @@ const previewHtml = computed(() => {
 
 onMounted(() => {
   store.loadFileList()
+  // 监听窗口大小变化
+  window.addEventListener('resize', handleResize)
 })
 
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', handleResize)
+})
+
+// 处理窗口大小变化
+let resizeTimer: ReturnType<typeof setTimeout> | undefined = undefined
+function handleResize() {
+  clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(() => {
+    window.location.reload()
+  }, 300) // 防抖：窗口大小稳定 300ms 后再刷新
+}
+
+// ========== 检查 File System Access API 支持 ==========
+function isFileSystemAPISupported() {
+  return 'showDirectoryPicker' in window && 'showSaveFilePicker' in window
+}
+
+// ========== 获取文件名（不含路径）==========
+function getFileName() {
+  return store.currentFile?.name || 'article.html'
+}
+
+// ========== 获取时间戳（到毫秒）==========
+function getTimestamp() {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  const hour = String(now.getHours()).padStart(2, '0')
+  const minute = String(now.getMinutes()).padStart(2, '0')
+  const second = String(now.getSeconds()).padStart(2, '0')
+  const millisecond = String(now.getMilliseconds()).padStart(3, '0')
+  return `${year}${month}${day}-${hour}${minute}${second}-${millisecond}`
+}
+
 // ========== 保存文件 ==========
-function handleSave() {
+async function handleSave() {
   const content = editContent.value
   if (!content) return
 
-  const fileName = store.currentFile?.name || 'article.html'
+  const fileName = getFileName()
+
+  // 检查 File System Access API 支持
+  if (!isFileSystemAPISupported()) {
+    toast.value?.show('❌ 浏览器不支持 File System Access API，请使用 Chrome/Edge 最新版')
+    // 降级为下载方式
+    downloadFile(fileName, content)
+    return
+  }
+
+  try {
+    // 如果已授权目录，直接保存
+    if (saveDirHandle.value) {
+      await saveToDirectory(saveDirHandle.value, fileName, content)
+      return
+    }
+
+    // 首次保存，让用户选择保存方式
+    const choice = confirm(
+      '首次保存，请选择保存方式：\n\n' +
+      '确定 = 选择保存目录（后续保存直接写入，无需确认）\n' +
+      '取消 = 每次保存时选择文件位置'
+    )
+
+    if (choice) {
+      // 选择保存目录
+      await requestDirectoryAccess(fileName, content)
+    } else {
+      // 单次保存文件
+      await saveFileOnce(fileName, content)
+    }
+  } catch (error: any) {
+    console.error('保存失败:', error)
+    if (error.name === 'AbortError') {
+      toast.value?.show('❌ 已取消保存')
+    } else {
+      toast.value?.show('❌ 保存失败：' + error.message)
+    }
+  }
+}
+
+// ========== 请求目录访问权限 ==========
+async function requestDirectoryAccess(fileName: string, content: string) {
+  try {
+    // 让用户选择保存目录
+    const dirHandle = await (window as any).showDirectoryPicker({
+      mode: 'readwrite',
+      startIn: 'documents'
+    })
+
+    // 检查权限
+    const permission = await dirHandle.requestPermission({ mode: 'readwrite' })
+    if (permission !== 'granted') {
+      toast.value?.show('❌ 未授权目录访问权限')
+      return
+    }
+
+    saveDirHandle.value = dirHandle
+    await saveToDirectory(dirHandle, fileName, content)
+  } catch (error: any) {
+    if (error.name !== 'AbortError') {
+      throw error
+    }
+  }
+}
+
+// ========== 保存到目录 ==========
+async function saveToDirectory(
+  dirHandle: FileSystemDirectoryHandle,
+  fileName: string,
+  content: string
+) {
+  try {
+    // 检查文件是否存在
+    let fileHandle: FileSystemFileHandle
+    try {
+      fileHandle = await dirHandle.getFileHandle(fileName)
+      // 文件存在，先备份
+      await backupFile(fileHandle, dirHandle)
+    } catch {
+      // 文件不存在，创建新文件
+      fileHandle = await dirHandle.getFileHandle(fileName, { create: true })
+    }
+
+    // 写入内容
+    const writable = await fileHandle.createWritable()
+    await writable.write(content)
+    await writable.close()
+
+    toast.value?.show(`✅ 已保存：${fileName}`)
+  } catch (error: any) {
+    console.error('保存到目录失败:', error)
+    // 可能是权限过期，清除 handle
+    saveDirHandle.value = null
+    throw new Error('目录访问权限已过期，请重新选择保存目录')
+  }
+}
+
+// ========== 备份文件 ==========
+async function backupFile(
+  fileHandle: FileSystemFileHandle,
+  dirHandle: FileSystemDirectoryHandle
+) {
+  const fileName = fileHandle.name
+  const timestamp = getTimestamp()
+  const backupFileName = `${fileName}.backup.${timestamp}`
+
+  // 读取原文件内容
+  const file = await fileHandle.getFile()
+  const originalContent = await file.text()
+
+  // 创建备份文件
+  const backupHandle = await dirHandle.getFileHandle(backupFileName, { create: true })
+  const writable = await backupHandle.createWritable()
+  await writable.write(originalContent)
+  await writable.close()
+
+  console.log(`已备份：${backupFileName}`)
+  toast.value?.show(`💾 已备份：${backupFileName}`)
+}
+
+// ========== 单次保存文件（不记住目录）==========
+async function saveFileOnce(fileName: string, content: string) {
+  try {
+    const fileHandle = await (window as any).showSaveFilePicker({
+      suggestedName: fileName,
+      types: [{
+        description: 'HTML 文件',
+        accept: { 'text/html': ['.html'] }
+      }]
+    })
+
+    const writable = await fileHandle.createWritable()
+    await writable.write(content)
+    await writable.close()
+
+    toast.value?.show(`✅ 已保存：${fileName}`)
+  } catch (error: any) {
+    if (error.name !== 'AbortError') {
+      throw error
+    }
+  }
+}
+
+// ========== 降级：下载文件 ==========
+function downloadFile(fileName: string, content: string) {
   const blob = new Blob([content], { type: 'text/html;charset=utf-8' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
@@ -64,8 +250,7 @@ function handleSave() {
   a.download = fileName
   a.click()
   URL.revokeObjectURL(url)
-
-  toast.value?.show('📥 文件已下载：' + fileName)
+  toast.value?.show(`📥 已下载：${fileName}`)
 }
 
 // ========== 恢复原始 ==========
@@ -76,15 +261,10 @@ function handleReset() {
   toast.value?.show('↩ 已恢复为原始内容')
 }
 
-// ========== 全选预览内容 ==========
-function handleSelectAll() {
-  const container = document.querySelector('.preview-container')
-  if (!container) return
-  const range = document.createRange()
-  range.selectNodeContents(container)
-  const selection = window.getSelection()
-  selection?.removeAllRanges()
-  selection?.addRange(range)
+// ========== 清空编辑内容 ==========
+function handleClear() {
+  store.setEditContent('')
+  toast.value?.show('🗑️ 已清空编辑器')
 }
 
 // ========== 复制到微信 ==========
@@ -100,7 +280,7 @@ function handleCopied() {
       @save="handleSave"
       @reset="handleReset"
       @copied="handleCopied"
-      @select-all="handleSelectAll"
+      @clear="handleClear"
     />
 
     <div class="main-layout">

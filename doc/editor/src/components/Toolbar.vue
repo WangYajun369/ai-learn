@@ -10,7 +10,6 @@ const emit = defineEmits<{
   save: []
   reset: []
   copied: []
-  'select-all': []
 }>()
 
 // 复制按钮引用（保留用于可能的未来扩展）
@@ -70,8 +69,10 @@ async function copyToWechat() {
   }
 }
 
-function selectAll() {
-  emit('select-all')
+function clearContent() {
+  // 清空编辑内容
+  store.setEditContent('')
+  emit('clear')
 }
 </script>
 
@@ -87,8 +88,8 @@ function selectAll() {
       💾 保存文件
     </button>
     <span class="toolbar-sep"></span>
-    <button class="btn btn-secondary btn-sm" @click="selectAll" title="全选文章内容">
-      📋 全选
+    <button class="btn btn-secondary btn-sm" @click="clearContent" title="清空编辑内容">
+      🗑️ 清空
     </button>
     <button ref="copyBtn" class="btn btn-primary" @click="copyToWechat" title="复制后可直接粘贴到微信公众号后台">
       📌 一键复制到微信
