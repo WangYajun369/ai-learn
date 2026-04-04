@@ -627,6 +627,7 @@ dependencies = [
     { name = "pick" },
     { name = "prompt-toolkit" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "zai-sdk" },
 ]
 
@@ -638,6 +639,7 @@ requires-dist = [
     { name = "pick", specifier = ">=2.2.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.48" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "zai-sdk", specifier = ">=0.2.2" },
 ]
 

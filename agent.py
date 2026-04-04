@@ -1,14 +1,100 @@
 import asyncio
 import os
 import json
+import yaml
+from pathlib import Path
 from contextlib import AsyncExitStack
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession
 from dotenv import load_dotenv
-from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.shortcuts import PromptSession
 
 load_dotenv()
+
+# ─────────────────────────────────────────────
+#  Skill 加载器（渐进式加载）
+# ─────────────────────────────────────────────
+
+class SkillLoader:
+    """
+    渐进式 Skill 加载器：
+      阶段 1：启动时仅加载 name + description（~100 tokens）
+      阶段 2：匹配成功后加载完整 SKILL.md（<5000 tokens）
+      阶段 3：执行时按需加载 scripts/ 或 references/
+    """
+
+    def __init__(self, skills_dir: str = "sales-analysis"):
+        self.skills_dir = Path(skills_dir)
+        self.skills: list[dict] = []  # 阶段 1 缓存
+        self._loaded_skill: dict | None = None  # 阶段 2 缓存
+
+    def load_summaries(self) -> list[dict]:
+        """
+        阶段 1：扫描 skills_dir，仅提取 SKILL.md 的 YAML 头部信息。
+        用于技能路由与快速匹配。
+        """
+        skill_md = self.skills_dir / "SKILL.md"
+        if not skill_md.exists():
+            return []
+
+        content = skill_md.read_text(encoding="utf-8")
+        # 解析 YAML front matter
+        if content.startswith("---"):
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                meta = yaml.safe_load(parts[1])
+                if meta and isinstance(meta, dict):
+                    self.skills = [{
+                        "name": meta.get("name", ""),
+                        "description": meta.get("description", "").strip(),
+                        "trigger_keywords": meta.get("trigger_keywords", []),
+                    }]
+        return self.skills
+
+    def match_skill(self, user_input: str) -> dict | None:
+        """根据用户输入匹配技能包，返回匹配的 skill summary"""
+        input_lower = user_input.lower()
+        for skill in self.skills:
+            # 检查触发词
+            for kw in skill.get("trigger_keywords", []):
+                if kw.lower() in input_lower:
+                    return skill
+            # 检查 description 关键词
+            for word in ["分析", "报告", "销售", "业绩"]:
+                if word in input_lower and "销售" in skill.get("description", ""):
+                    return skill
+        return None
+
+    def load_full_skill(self, skill_name: str) -> str | None:
+        """
+        阶段 2：加载完整的 SKILL.md 内容。
+        仅在技能匹配成功后调用。
+        """
+        skill_md = self.skills_dir / "SKILL.md"
+        if not skill_md.exists():
+            return None
+        content = skill_md.read_text(encoding="utf-8")
+        # 去掉 YAML front matter，只保留指令部分
+        if content.startswith("---"):
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                content = parts[2].strip()
+        return content
+
+    def load_reference(self, filename: str) -> str | None:
+        """阶段 3：按需加载 references/ 中的文件"""
+        ref_path = self.skills_dir / "references" / filename
+        if ref_path.exists():
+            return ref_path.read_text(encoding="utf-8")
+        return None
+
+    def get_script_path(self, script_name: str) -> str | None:
+        """阶段 3：获取 scripts/ 中脚本的路径"""
+        script_path = self.skills_dir / "scripts" / script_name
+        if script_path.exists():
+            return str(script_path)
+        return None
+
 
 # ─────────────────────────────────────────────
 #  模型后端：DashScope（通义千问）
@@ -51,16 +137,6 @@ class QwenBackend:
         ]
 
     def chat(self, messages: list, tools: list) -> dict:
-        """
-        调用模型，返回统一的中间结构：
-          {
-            "content": str | None,          # 文本回复（无工具调用时有值）
-            "tool_calls": [                 # 工具调用列表（可能为空）
-              {"id": ..., "name": ..., "arguments": {...}}
-            ],
-            "raw_message": dict             # 追加到 messages 的原始消息字典
-          }
-        """
         resp = self._Generation.call(
             model=self.model,
             api_key=self.api_key,
@@ -71,7 +147,7 @@ class QwenBackend:
         if resp.status_code != 200:
             raise RuntimeError(f"DashScope 调用失败 [{resp.status_code}]：{resp.message}")
 
-        msg = resp.output.choices[0].message  # DictMixin（dict 子类）
+        msg = resp.output.choices[0].message
         raw = dict(msg)
 
         tool_calls = []
@@ -90,7 +166,6 @@ class QwenBackend:
         }
 
     def make_tool_result_message(self, tool_call: dict, result_text: str) -> dict:
-        """构造工具结果消息（Qwen 使用 role=function）"""
         return {
             "role": "function",
             "name": tool_call["name"],
@@ -111,7 +186,6 @@ class GLMBackend:
         self.model = model
 
     def check(self) -> str | None:
-        """检查模型是否可用，返回错误信息或 None"""
         api_key = os.getenv("BIGMODEL_API_KEY")
         if not api_key or "your-" in api_key:
             return "未配置 BIGMODEL_API_KEY，请在 .env 文件中设置有效的 API Key"
@@ -125,7 +199,6 @@ class GLMBackend:
         return None
 
     def build_tools(self, mcp_tools) -> list:
-        """将 MCP 工具列表转换为 OpenAI-style tools 格式"""
         return [
             {
                 "type": "function",
@@ -140,7 +213,6 @@ class GLMBackend:
 
     @staticmethod
     def _clean_surrogates(o):
-        """递归清洗对象树中所有字符串的 surrogate 字符"""
         if isinstance(o, str):
             return o.encode("utf-8", errors="replace").decode("utf-8")
         if isinstance(o, dict):
@@ -150,7 +222,6 @@ class GLMBackend:
         return o
 
     def chat(self, messages: list, tools: list) -> dict:
-        # 发送前对整个 messages 列表做安全清洗，防止 surrogate 字符导致 httpx 序列化失败
         safe_messages = self._clean_surrogates(messages)
 
         resp = self.client.chat.completions.create(
@@ -161,16 +232,13 @@ class GLMBackend:
         )
         msg = resp.choices[0].message
 
-        # 将 message 对象序列化为纯原生 Python dict 并清洗 surrogate 字符
         raw = json.loads(json.dumps(msg.model_dump(), default=str))
         raw = self._clean_surrogates(raw)
-        # 去掉值为 None 的多余字段，保持消息列表整洁
         raw = {k: v for k, v in raw.items() if v is not None}
 
         tool_calls = []
         if msg.tool_calls:
             for tc in msg.tool_calls:
-                # arguments 可能是 str 或 bytes，统一转为 str 再解析
                 args_raw = tc.function.arguments
                 if isinstance(args_raw, bytes):
                     args_raw = args_raw.decode("utf-8", errors="replace")
@@ -187,7 +255,6 @@ class GLMBackend:
         }
 
     def make_tool_result_message(self, tool_call: dict, result_text: str) -> dict:
-        """构造工具结果消息（GLM 使用 role=tool + tool_call_id）"""
         return {
             "role": "tool",
             "tool_call_id": tool_call["id"],
@@ -196,7 +263,7 @@ class GLMBackend:
 
 
 # ─────────────────────────────────────────────
-#  Agent 核心（与模型无关）
+#  Agent 核心（集成 Skills）
 # ─────────────────────────────────────────────
 
 BACKENDS = {
@@ -216,6 +283,17 @@ async def run_agent(backend_name: str):
 
     backend = BACKENDS[backend_name]()
 
+    # ── 阶段 1：加载 Skill 摘要（~100 tokens）──
+    skill_loader = SkillLoader()
+    skills = skill_loader.load_summaries()
+    if skills:
+        print(f"📦 已加载 {len(skills)} 个技能包摘要：")
+        for s in skills:
+            desc_first = s["description"].split(chr(10))[0][:60]
+            print(f"   - {s['name']}：{desc_first}")
+    else:
+        print("⚠️ 未找到技能包，将以基础模式运行")
+
     # 1. 配置 MCP Server 启动参数
     server_params = StdioServerParameters(
         command="uv",
@@ -224,7 +302,7 @@ async def run_agent(backend_name: str):
     )
 
     async with AsyncExitStack() as stack:
-        # 2. 连接 MCP Server（解包 read/write 两个流）
+        # 2. 连接 MCP Server
         read_stream, write_stream = await stack.enter_async_context(
             stdio_client(server_params)
         )
@@ -233,7 +311,7 @@ async def run_agent(backend_name: str):
         )
         await session.initialize()
 
-        # 3. 获取工具列表并转换为对应模型格式
+        # 3. 获取工具列表
         tools_resp = await session.list_tools()
         print(f"✅ 已加载 {len(tools_resp.tools)} 个工具：")
         for tool in tools_resp.tools:
@@ -241,9 +319,9 @@ async def run_agent(backend_name: str):
             print(f"   - {tool.name}：{desc_first_line}")
         tools = backend.build_tools(tools_resp.tools)
 
-        # 3.5 构建系统提示词，告知 Agent 可用能力
+        # 3.5 构建基础系统提示词
         tool_names = [f"- {tool.name}：{tool.description.split(chr(10))[0]}" for tool in tools_resp.tools]
-        system_prompt = (
+        base_system_prompt = (
             "你是一个销售数据查询助手。你可以通过工具来帮助用户查询销售信息。\n\n"
             f"你可以使用以下工具：\n{chr(10).join(tool_names)}\n\n"
             '当用户问"有哪些功能"、"你能做什么"时，请介绍以上工具的能力。\n'
@@ -252,7 +330,9 @@ async def run_agent(backend_name: str):
         )
 
         # 4. 对话主循环
-        messages = [{"role": "system", "content": system_prompt}]
+        messages = [{"role": "system", "content": base_system_prompt}]
+        active_skill: dict | None = None  # 当前激活的技能
+
         pt_session = PromptSession()
         while True:
             user_input = await pt_session.prompt_async("\n👤 你：")
@@ -261,21 +341,40 @@ async def run_agent(backend_name: str):
 
             messages.append({"role": "user", "content": user_input})
 
-            # 5. 内层循环：支持多步工具调用（链式推理）
+            # ── 阶段 1→2：技能匹配 ──
+            matched = skill_loader.match_skill(user_input) if skills else None
+            if matched and active_skill is None:
+                print(f"\n📦 匹配到技能包：{matched['name']}")
+                full_skill = skill_loader.load_full_skill(matched["name"])
+                if full_skill:
+                    # ── 阶段 2：加载完整 SKILL.md（<5000 tokens）──
+                    active_skill = matched
+                    messages[0] = {
+                        "role": "system",
+                        "content": full_skill,
+                    }
+                    print("   ✅ 技能指令已加载（完整 SKILL.md）")
+
+                    # 同时加载报告模板作为参考
+                    template = skill_loader.load_reference("report_template.md")
+                    if template:
+                        messages.append({
+                            "role": "system",
+                            "content": f"以下是你的报告输出模板，请严格按照此格式生成报告：\n\n{template}",
+                        })
+                        print("   ✅ 报告模板已加载（references/report_template.md）")
+
+            # 5. 内层循环：支持多步工具调用
             while True:
                 result = backend.chat(messages, tools)
-
-                # 将模型消息追加到历史
                 messages.append(result["raw_message"])
 
                 if result["tool_calls"]:
-                    # 有工具调用：逐个执行，追加结果，继续循环
                     for tc in result["tool_calls"]:
                         print(f"🔧 调用工具：{tc['name']}({tc['arguments']})...")
 
                         tool_resp = await session.call_tool(tc["name"], tc["arguments"])
 
-                        # 提取工具返回文本
                         tool_text = ""
                         for item in tool_resp.content:
                             tool_text += item.text if hasattr(item, "text") else str(item)
@@ -283,10 +382,7 @@ async def run_agent(backend_name: str):
                         messages.append(
                             backend.make_tool_result_message(tc, tool_text)
                         )
-
-                    # 继续内层循环，让模型决定是否还需要调用更多工具
                 else:
-                    # 模型给出最终文本回复，退出内层循环
                     print(f"\n🤖 Agent：{result['content'] or ''}")
                     break
 
@@ -301,7 +397,6 @@ if __name__ == "__main__":
     while True:
         title = "🤖 请选择大模型后端（↑↓ 移动，Enter 确认）："
         selected, _ = pick.pick(options, title, indicator="❯")
-        # pick (curses) 退出后终端可能有残留，清一下
         print("\033c", end="", flush=True)
         backend_arg = selected.value
 
@@ -309,12 +404,12 @@ if __name__ == "__main__":
             print("\n👋 再见！")
             break
 
-        # 检查模型可用性
         label = BACKEND_LABELS[backend_arg]
         print(f"\n🔍 正在检查 {label} ...")
         err = BACKENDS[backend_arg]().check()
         if err:
             print(f"❌ 模型不可用：{err}")
+            from prompt_toolkit import prompt as pt_prompt
             pt_prompt("\n按 Enter 键重新选择...")
             print()
             continue
