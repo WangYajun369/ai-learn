@@ -277,6 +277,35 @@ BACKEND_LABELS = {
 }
 
 
+def _print_skill_packages(skill_loader: SkillLoader, skills: list):
+    """格式化打印已加载的技能包信息（名称、描述、触发词、脚本、参考文件）"""
+    import textwrap
+    if not skills:
+        print("⚠️ 未找到技能包，将以基础模式运行")
+        return
+    print(f"\n📦 已加载 {len(skills)} 个技能包：")
+    for s in skills:
+        print(f"\n   ┌─ {s['name']}")
+        desc = " ".join(s["description"].strip().splitlines())
+        for line in textwrap.wrap(desc, width=56, initial_indent="   │  ", subsequent_indent="   │  "):
+            print(line)
+        if s.get("trigger_keywords"):
+            kw_str = ", ".join(s["trigger_keywords"])
+            print(f"   │  触发词：{kw_str}")
+        # 列出附带的脚本和参考文件
+        scripts_dir = skill_loader.skills_dir / "scripts"
+        refs_dir = skill_loader.skills_dir / "references"
+        if scripts_dir.exists():
+            py_files = sorted(p.name for p in scripts_dir.glob("*.py") if p.name != "__init__.py")
+            if py_files:
+                print(f"   │  脚本：{', '.join(py_files)}")
+        if refs_dir.exists():
+            ref_files = sorted(p.name for p in refs_dir.glob("*") if p.name != "__init__.py" and not p.name.endswith(".pyc"))
+            if ref_files:
+                print(f"   │  参考：{', '.join(ref_files)}")
+        print(f"   └{'─' * (len(s['name']) + 5)}")
+
+
 async def run_agent(backend_name: str):
     label = BACKEND_LABELS[backend_name]
     print(f"\n🚀 正在启动 MCP Agent（{label}）...")
@@ -286,13 +315,6 @@ async def run_agent(backend_name: str):
     # ── 阶段 1：加载 Skill 摘要（~100 tokens）──
     skill_loader = SkillLoader()
     skills = skill_loader.load_summaries()
-    if skills:
-        print(f"📦 已加载 {len(skills)} 个技能包摘要：")
-        for s in skills:
-            desc_first = s["description"].split(chr(10))[0][:60]
-            print(f"   - {s['name']}：{desc_first}")
-    else:
-        print("⚠️ 未找到技能包，将以基础模式运行")
 
     # 1. 配置 MCP Server 启动参数
     server_params = StdioServerParameters(
@@ -301,123 +323,138 @@ async def run_agent(backend_name: str):
         env={"PATH": os.environ["PATH"]},
     )
 
-    async with AsyncExitStack() as stack:
-        # 2. 连接 MCP Server
-        read_stream, write_stream = await stack.enter_async_context(
-            stdio_client(server_params)
-        )
-        session = await stack.enter_async_context(
-            ClientSession(read_stream, write_stream)
-        )
-        await session.initialize()
+    try:
+        async with AsyncExitStack() as stack:
+            # 2. 连接 MCP Server
+            read_stream, write_stream = await stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            session = await stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await session.initialize()
 
-        # 3. 获取工具列表
-        tools_resp = await session.list_tools()
-        print(f"✅ 已加载 {len(tools_resp.tools)} 个工具：")
-        for tool in tools_resp.tools:
-            desc_first_line = tool.description.split(chr(10))[0]
-            print(f"   - {tool.name}：{desc_first_line}")
-        tools = backend.build_tools(tools_resp.tools)
+            # 3. 获取工具列表
+            tools_resp = await session.list_tools()
+            print(f"✅ 已加载 {len(tools_resp.tools)} 个工具：")
+            for tool in tools_resp.tools:
+                desc_first_line = tool.description.split(chr(10))[0]
+                print(f"   - {tool.name}：{desc_first_line}")
+            tools = backend.build_tools(tools_resp.tools)
 
-        # 3.5 构建基础系统提示词
-        tool_names = [f"- {tool.name}：{tool.description.split(chr(10))[0]}" for tool in tools_resp.tools]
-        base_system_prompt = (
-            "你是一个销售数据查询助手。你可以通过工具来帮助用户查询销售信息。\n\n"
-            f"你可以使用以下工具：\n{chr(10).join(tool_names)}\n\n"
-            '当用户问"有哪些功能"、"你能做什么"时，请介绍以上工具的能力。\n'
-            '当用户问"有哪些产品"时，请调用 list_products 工具查询。\n'
-            "回复使用中文。"
-        )
+            # 3.5 打印技能包信息
+            _print_skill_packages(skill_loader, skills)
 
-        # 4. 对话主循环
-        messages = [{"role": "system", "content": base_system_prompt}]
-        active_skill: dict | None = None  # 当前激活的技能
+            # 3.6 构建基础系统提示词
+            tool_names = [f"- {tool.name}：{tool.description.split(chr(10))[0]}" for tool in tools_resp.tools]
+            base_system_prompt = (
+                "你是一个销售数据查询助手。你可以通过工具来帮助用户查询销售信息。\n\n"
+                f"你可以使用以下工具：\n{chr(10).join(tool_names)}\n\n"
+                '当用户问"有哪些功能"、"你能做什么"时，请介绍以上工具的能力。\n'
+                '当用户问"有哪些产品"时，请调用 list_products 工具查询。\n'
+                "回复使用中文。"
+            )
 
-        pt_session = PromptSession()
-        while True:
-            user_input = await pt_session.prompt_async("\n👤 你：")
-            if user_input.lower() in ["exit", "quit"]:
-                break
+            # 4. 对话主循环
+            messages = [{"role": "system", "content": base_system_prompt}]
+            active_skill: dict | None = None  # 当前激活的技能
 
-            messages.append({"role": "user", "content": user_input})
-
-            # ── 阶段 1→2：技能匹配 ──
-            matched = skill_loader.match_skill(user_input) if skills else None
-            if matched and active_skill is None:
-                print(f"\n📦 匹配到技能包：{matched['name']}")
-                full_skill = skill_loader.load_full_skill(matched["name"])
-                if full_skill:
-                    # ── 阶段 2：加载完整 SKILL.md（<5000 tokens）──
-                    active_skill = matched
-                    messages[0] = {
-                        "role": "system",
-                        "content": full_skill,
-                    }
-                    print("   ✅ 技能指令已加载（完整 SKILL.md）")
-
-                    # 同时加载报告模板作为参考
-                    template = skill_loader.load_reference("report_template.md")
-                    if template:
-                        messages.append({
-                            "role": "system",
-                            "content": f"以下是你的报告输出模板，请严格按照此格式生成报告：\n\n{template}",
-                        })
-                        print("   ✅ 报告模板已加载（references/report_template.md）")
-
-            # 5. 内层循环：支持多步工具调用
+            pt_session = PromptSession()
             while True:
-                result = backend.chat(messages, tools)
-                messages.append(result["raw_message"])
-
-                if result["tool_calls"]:
-                    for tc in result["tool_calls"]:
-                        print(f"🔧 调用工具：{tc['name']}({tc['arguments']})...")
-
-                        tool_resp = await session.call_tool(tc["name"], tc["arguments"])
-
-                        tool_text = ""
-                        for item in tool_resp.content:
-                            tool_text += item.text if hasattr(item, "text") else str(item)
-
-                        messages.append(
-                            backend.make_tool_result_message(tc, tool_text)
-                        )
-                else:
-                    print(f"\n🤖 Agent：{result['content'] or ''}")
+                try:
+                    user_input = await pt_session.prompt_async("\n👤 你：")
+                except (KeyboardInterrupt, EOFError):
                     break
+                if user_input.lower() in ["exit", "quit"]:
+                    break
+
+                messages.append({"role": "user", "content": user_input})
+
+                # ── 阶段 1→2：技能匹配 ──
+                matched = skill_loader.match_skill(user_input) if skills else None
+                if matched and active_skill is None:
+                    print(f"\n📦 匹配到技能包：{matched['name']}")
+                    full_skill = skill_loader.load_full_skill(matched["name"])
+                    if full_skill:
+                        # ── 阶段 2：加载完整 SKILL.md（<5000 tokens）──
+                        active_skill = matched
+                        messages[0] = {
+                            "role": "system",
+                            "content": full_skill,
+                        }
+                        print("   ✅ 技能指令已加载（完整 SKILL.md）")
+
+                        # 同时加载报告模板作为参考
+                        template = skill_loader.load_reference("report_template.md")
+                        if template:
+                            messages.append({
+                                "role": "system",
+                                "content": f"以下是你的报告输出模板，请严格按照此格式生成报告：\n\n{template}",
+                            })
+                            print("   ✅ 报告模板已加载（references/report_template.md）")
+
+                # 5. 内层循环：支持多步工具调用
+                while True:
+                    result = backend.chat(messages, tools)
+                    messages.append(result["raw_message"])
+
+                    if result["tool_calls"]:
+                        for tc in result["tool_calls"]:
+                            print(f"🔧 调用工具：{tc['name']}({tc['arguments']})...")
+
+                            tool_resp = await session.call_tool(tc["name"], tc["arguments"])
+
+                            tool_text = ""
+                            for item in tool_resp.content:
+                                tool_text += item.text if hasattr(item, "text") else str(item)
+
+                            messages.append(
+                                backend.make_tool_result_message(tc, tool_text)
+                            )
+                    else:
+                        print(f"\n🤖 Agent：{result['content'] or ''}")
+                        break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\n👋 再见！")
 
 
 if __name__ == "__main__":
     import pick
+    import sys
 
-    keys = list(BACKENDS.keys())
-    options = [pick.Option(BACKEND_LABELS[k], k) for k in keys]
-    options.append(pick.Option("退出程序", "__quit__"))
+    try:
+        keys = list(BACKENDS.keys())
+        options = [pick.Option(BACKEND_LABELS[k], k) for k in keys]
+        options.append(pick.Option("退出程序", "__quit__"))
 
-    while True:
-        title = "🤖 请选择大模型后端（↑↓ 移动，Enter 确认）："
-        selected, _ = pick.pick(options, title, indicator="❯")
-        print("\033c", end="", flush=True)
-        backend_arg = selected.value
+        while True:
+            title = "🤖 请选择大模型后端（↑↓ 移动，Enter 确认）："
+            selected, _ = pick.pick(options, title, indicator="❯")
+            print("\033c", end="", flush=True)
+            backend_arg = selected.value
 
-        if backend_arg == "__quit__":
-            print("\n👋 再见！")
+            if backend_arg == "__quit__":
+                break
+
+            label = BACKEND_LABELS[backend_arg]
+            print(f"\n🔍 正在检查 {label} ...")
+            err = BACKENDS[backend_arg]().check()
+            if err:
+                print(f"❌ 模型不可用：{err}")
+                from prompt_toolkit import prompt as pt_prompt
+                pt_prompt("\n按 Enter 键重新选择...")
+                print()
+                continue
+            print(f"✅ {label} — 当前模型可用")
             break
-
-        label = BACKEND_LABELS[backend_arg]
-        print(f"\n🔍 正在检查 {label} ...")
-        err = BACKENDS[backend_arg]().check()
-        if err:
-            print(f"❌ 模型不可用：{err}")
-            from prompt_toolkit import prompt as pt_prompt
-            pt_prompt("\n按 Enter 键重新选择...")
-            print()
-            continue
-        print(f"✅ {label} — 当前模型可用")
-        break
+    except KeyboardInterrupt:
+        print("\n👋 再见！")
+        sys.exit(0)
 
     if backend_arg == "__quit__":
-        import sys
+        print("\n👋 再见！")
         sys.exit(0)
 
     asyncio.run(run_agent(backend_arg))
