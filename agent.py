@@ -18,6 +18,10 @@ from dotenv import load_dotenv
 # 加载 .env 文件中的环境变量
 load_dotenv()
 
+# 初始化日志系统
+from agent.log import setup_logging
+setup_logging(level=30)  # WARNING=30，默认只显示警告；DEBUG=10 可查看详细内部日志
+
 from agent import SkillLoader, AgentCore
 from agent.backends import BACKENDS, BACKEND_LABELS, get_backend
 from memory_store import MemoryStore
@@ -69,6 +73,63 @@ def select_backend() -> str | None:
         return None
 
 
+async def run_agent_loop(backend_name: str) -> str | None:
+    """
+    Agent 主循环，支持运行时模型切换。
+    在同一个事件循环中运行所有操作。
+
+    Returns:
+        str: 如果需要切换模型，返回新的 backend_name
+        None: 正常退出
+    """
+    # 创建依赖组件（只需创建一次）
+    skill_loader = SkillLoader()
+    memory_store = MemoryStore()
+    conv_store = ConversationStore()
+
+    # 主循环：支持运行时模型切换
+    while True:
+        # 创建后端实例
+        backend_class = get_backend(backend_name)
+        backend = backend_class()
+
+        # 创建 Agent 核心
+        agent = AgentCore(
+            backend=backend,
+            skill_loader=skill_loader,
+            memory_store=memory_store,
+            conv_store=conv_store,
+        )
+
+        # 运行 Agent，返回值可能是新的 backend_name
+        result = await agent.run(backend_name)
+
+        # 检查是否需要切换模型
+        if isinstance(result, str) and result in BACKENDS:
+            backend_name = result
+            print(f"\n🔄 准备切换到新模型：{BACKEND_LABELS.get(backend_name, backend_name)}")
+            # 验证新模型可用
+            backend_class = get_backend(backend_name)
+            backend = backend_class()
+            err = backend.check()
+            if err:
+                print(f"❌ 模型不可用：{err}")
+                # 回到选择界面
+                new_backend = select_backend()
+                if new_backend is None:
+                    print("\n👋 再见！")
+                    return None
+                backend_name = new_backend
+            else:
+                print(f"✅ {BACKEND_LABELS.get(backend_name, backend_name)} — 模型可用")
+            continue
+        else:
+            # 正常退出
+            break
+
+    return None
+
+
 def main():
     """主入口函数"""
     # REPL 模式：选择后端
@@ -77,25 +138,10 @@ def main():
         print("\n👋 再见！")
         sys.exit(0)
 
-    # 创建后端实例
-    backend_class = get_backend(backend_name)
-    backend = backend_class()
+    # 在单个事件循环中运行（支持模型切换）
+    asyncio.run(run_agent_loop(backend_name))
 
-    # 创建依赖组件
-    skill_loader = SkillLoader()
-    memory_store = MemoryStore()
-    conv_store = ConversationStore()
-
-    # 创建 Agent 核心
-    agent = AgentCore(
-        backend=backend,
-        skill_loader=skill_loader,
-        memory_store=memory_store,
-        conv_store=conv_store,
-    )
-
-    # 运行 Agent
-    asyncio.run(agent.run(backend_name))
+    print("\n👋 再见！")
 
 
 if __name__ == "__main__":

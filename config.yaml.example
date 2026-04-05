@@ -1,0 +1,41 @@
+# MCP Agent 配置文件
+# 复制此文件为 config.yaml 并按需修改
+
+# ─────────────────────────────────────────────
+# 数据库配置
+# ─────────────────────────────────────────────
+database:
+  # 数据库路径（支持相对路径和绝对路径）
+  # sales_db: ./object_db/sales.db
+  # memory_db: ./object_db/memory_db
+  # conversations_db: ./object_db/conversations.db
+  # user_profile_db: ./object_db/user_profile.db
+  
+  # 连接池配置
+  pool_size: 5           # 连接池大小
+  pool_timeout: 30       # 连接超时（秒）
+
+# ─────────────────────────────────────────────
+# MCP Server 配置
+# ─────────────────────────────────────────────
+mcp_server:
+  # 连接重试配置
+  retry_max_attempts: 3   # 最大重试次数
+  retry_base_delay: 1.0  # 基础延迟（秒）
+  retry_max_delay: 10.0  # 最大延迟（秒）
+  timeout: 30.0          # 连接超时（秒）
+
+# ─────────────────────────────────────────────
+# 缓存配置
+# ─────────────────────────────────────────────
+cache:
+  enabled: true           # 是否启用缓存
+  ttl_seconds: 300        # 缓存 TTL（秒），默认 5 分钟
+  max_size: 1000         # 最大缓存条目数
+
+# ─────────────────────────────────────────────
+# 会话配置
+# ─────────────────────────────────────────────
+session:
+  export_dir: ./exports   # 会话导出目录
+  max_history_display: 10 # 历史会话列表显示数量

@@ -207,10 +207,10 @@ class MemoryStore:
         conversation_lines = []
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content", "")
+            content = msg.get("content") or ""
             if role == "system":
                 continue
-            if not content or not content.strip():
+            if not content.strip():
                 continue
             # 截断过长的内容
             content = content.strip()[:500]

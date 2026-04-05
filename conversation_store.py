@@ -1,12 +1,15 @@
 """
-SQLite 会话记录存储模块
+SQLite 会话记录存储模块（增强版）
 
 记录每次 Agent 会话的完整信息：
 - 会话元信息（模型、启动时间、状态）
 - 用户问题与 Agent 回答
 - 工具调用链（工具名、参数、返回结果、耗时）
 
-存储路径：./conversations.db
+增强功能：
+- 会话导出（JSON/Markdown）
+- 会话搜索
+- 会话对比
 """
 
 import sqlite3
@@ -14,12 +17,13 @@ import json
 import time
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 DEFAULT_DB_PATH = Path(__file__).parent / "object_db" / "conversations.db"
 
 
 class ConversationStore:
-    """SQLite 会话记录存储"""
+    """SQLite 会话记录存储（增强版）"""
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
@@ -60,13 +64,15 @@ class ConversationStore:
                 started_at  TEXT NOT NULL,
                 ended_at    TEXT,
                 turn_count  INTEGER DEFAULT 0,
-                status      TEXT DEFAULT 'active'   -- active / closed
+                status      TEXT DEFAULT 'active',
+                title       TEXT,
+                tags        TEXT
             );
 
             CREATE TABLE IF NOT EXISTS messages (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id  TEXT NOT NULL,
-                role        TEXT NOT NULL,           -- user / assistant
+                role        TEXT NOT NULL,
                 content     TEXT,
                 turn_order  INTEGER NOT NULL,
                 created_at  TEXT NOT NULL,
@@ -78,16 +84,18 @@ class ConversationStore:
                 session_id  TEXT NOT NULL,
                 message_id  INTEGER,
                 tool_name   TEXT NOT NULL,
-                arguments   TEXT,                    -- JSON
-                result      TEXT,                    -- 工具返回文本
-                duration_ms INTEGER,                 -- 耗时（毫秒）
+                arguments   TEXT,
+                result      TEXT,
+                duration_ms INTEGER,
                 created_at  TEXT NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id),
                 FOREIGN KEY (message_id) REFERENCES messages(id)
             );
-
+            
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_content ON messages(content);
             CREATE INDEX IF NOT EXISTS idx_toolcalls_session ON tool_calls(session_id);
+            CREATE INDEX IF NOT EXISTS idx_toolcalls_toolname ON tool_calls(tool_name);
         """)
         self._conn.commit()
 
@@ -278,3 +286,165 @@ class ConversationStore:
             "total_messages": total_msgs,
             "total_tool_calls": total_tools,
         }
+
+    # ── 增强功能：会话搜索 ──
+
+    def search_sessions(self, keyword: str, limit: int = 20) -> list[dict]:
+        """
+        搜索包含关键词的会话
+        
+        Args:
+            keyword: 搜索关键词
+            limit: 返回数量限制
+            
+        Returns:
+            匹配的会话列表（包含匹配的片段）
+        """
+        if not keyword or not keyword.strip():
+            return []
+        
+        keyword = f"%{keyword.strip()}%"
+        
+        # 搜索消息内容
+        rows = self._conn.execute("""
+            SELECT DISTINCT s.id, s.model, s.started_at, s.ended_at, s.turn_count, s.status,
+                   m.content as matched_content
+            FROM sessions s
+            JOIN messages m ON s.id = m.session_id
+            WHERE m.content LIKE ? AND m.role = 'user'
+            ORDER BY s.started_at DESC
+            LIMIT ?
+        """, (keyword, limit)).fetchall()
+        
+        return [dict(r) for r in rows]
+
+    def search_by_tool(self, tool_name: str, limit: int = 20) -> list[dict]:
+        """
+        搜索使用过指定工具的会话
+        
+        Args:
+            tool_name: 工具名称
+            limit: 返回数量限制
+            
+        Returns:
+            使用过该工具的会话列表
+        """
+        rows = self._conn.execute("""
+            SELECT DISTINCT s.id, s.model, s.started_at, s.ended_at, s.turn_count,
+                   COUNT(t.id) as tool_usage_count
+            FROM sessions s
+            JOIN tool_calls t ON s.id = t.session_id
+            WHERE t.tool_name = ?
+            GROUP BY s.id
+            ORDER BY s.started_at DESC
+            LIMIT ?
+        """, (tool_name, limit)).fetchall()
+        
+        return [dict(r) for r in rows]
+
+    # ── 增强功能：会话导出 ──
+
+    def export_session(self, session_id: str, format: str = "json") -> Optional[str]:
+        """
+        导出会话为指定格式
+        
+        Args:
+            session_id: 会话 ID
+            format: 格式（json/markdown）
+            
+        Returns:
+            导出的内容字符串
+        """
+        session = self.get_session_detail(session_id)
+        if not session:
+            return None
+        
+        if format == "json":
+            return json.dumps(session, ensure_ascii=False, indent=2)
+        
+        elif format == "markdown":
+            lines = [
+                f"# 会话记录",
+                "",
+                f"- **会话 ID**: {session['id']}",
+                f"- **模型**: {session['model']}",
+                f"- **开始时间**: {session['started_at']}",
+                f"- **结束时间**: {session.get('ended_at', '进行中')}",
+                f"- **对话轮次**: {session['turn_count']}",
+                f"- **状态**: {session['status']}",
+                "",
+                "---",
+                "",
+                "## 对话记录",
+                "",
+            ]
+            
+            for msg in session.get("messages", []):
+                role_icon = "👤" if msg["role"] == "user" else "🤖"
+                role_name = "用户" if msg["role"] == "user" else "助手"
+                content = msg["content"] or ""
+                content = content.replace("\n", "\n> ")
+                lines.append(f"### {role_icon} {role_name}")
+                lines.append(f"> {content}")
+                lines.append("")
+            
+            if session.get("tool_calls"):
+                lines.extend([
+                    "---",
+                    "",
+                    "## 工具调用",
+                    "",
+                ])
+                for tc in session["tool_calls"]:
+                    args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                    lines.append(f"### 🔧 {tc['tool_name']}")
+                    lines.append(f"- 耗时: {tc['duration_ms']}ms")
+                    lines.append(f"- 参数: `{json.dumps(args, ensure_ascii=False)}`")
+                    lines.append("")
+            
+            return "\n".join(lines)
+        
+        return None
+
+    def export_session_to_file(self, session_id: str, output_path: Path, format: str = "json") -> bool:
+        """
+        导出会话到文件
+        
+        Args:
+            session_id: 会话 ID
+            output_path: 输出文件路径
+            format: 格式（json/markdown）
+            
+        Returns:
+            是否成功
+        """
+        content = self.export_session(session_id, format)
+        if content is None:
+            return False
+        
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return True
+        except Exception:
+            return False
+
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        """设置会话标题"""
+        self._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?",
+            (title[:200], session_id),  # 限制标题长度
+        )
+        self._conn.commit()
+        return True
+
+    def set_session_tags(self, session_id: str, tags: list[str]) -> bool:
+        """设置会话标签"""
+        tags_json = json.dumps(tags, ensure_ascii=False)
+        self._conn.execute(
+            "UPDATE sessions SET tags = ? WHERE id = ?",
+            (tags_json, session_id),
+        )
+        self._conn.commit()
+        return True

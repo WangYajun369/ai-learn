@@ -1,8 +1,9 @@
 """
-会话记录命令处理器
+会话记录命令处理器（增强版）
 """
 
 import json
+from pathlib import Path
 
 import pick as _pick
 
@@ -15,6 +16,7 @@ class HistoryCommandHandler:
     def __init__(self, conv_store: ConversationStore, enabled: bool):
         self.conv_store = conv_store
         self.enabled = enabled
+        self._export_dir = Path(__file__).parent.parent.parent / "exports"
 
     def handle(self, user_input: str) -> str | bool:
         """
@@ -57,6 +59,18 @@ class HistoryCommandHandler:
 
         if sub_cmd == "clear":
             return self._handle_clear()
+        
+        # 新增：搜索
+        if sub_cmd == "search" or sub_cmd.startswith("search "):
+            return self._handle_search(cmd)
+        
+        # 新增：导出
+        if sub_cmd == "export" or sub_cmd.startswith("export "):
+            return self._handle_export(cmd)
+        
+        # 新增：按工具搜索
+        if sub_cmd == "tools" or sub_cmd.startswith("tools "):
+            return self._handle_tools(cmd)
 
         self._print_help()
         return True
@@ -235,14 +249,123 @@ class HistoryCommandHandler:
         print(f"🗑️ 已清空全部 {count} 个会话")
         print("💡 提示：下一条消息将自动创建新会话")
         return True
+    
+    def _handle_search(self, cmd: str) -> bool:
+        """搜索会话"""
+        keyword = cmd.split(maxsplit=2)[2].strip() if len(cmd.split(maxsplit=2)) > 2 else ""
+        
+        if not keyword:
+            keyword = input("🔍 输入搜索关键词：").strip()
+        
+        if not keyword:
+            print("⚠️ 请输入搜索关键词")
+            return True
+        
+        results = self.conv_store.search_sessions(keyword)
+        
+        if not results:
+            print(f"🔍 未找到包含「{keyword}」的会话")
+            return True
+        
+        print(f"🔍 找到 {len(results)} 个匹配的会话：\n")
+        for i, s in enumerate(results[:10], 1):
+            status = "🟢" if s["status"] == "active" else "⚫"
+            matched = s.get("matched_content", "")[:80]
+            if len(matched) >= 80:
+                matched += "..."
+            print(f"   {i}. {status} [{s['id']}]")
+            print(f"      📅 {s['started_at']}  💬 {s.get('turn_count', 0)} 轮")
+            print(f"      💬 {matched}")
+            print()
+        return True
+    
+    def _handle_export(self, cmd: str) -> bool:
+        """导出会话"""
+        parts = cmd.split(maxsplit=2)
+        sid = parts[2].strip() if len(parts) > 2 else ""
+        fmt = "markdown"
+        
+        # 检查格式参数
+        if sid and "=" in sid:
+            sid_part, fmt_part = sid.rsplit("=", 1)
+            sid = sid_part.strip()
+            fmt = fmt_part.strip().lower()
+            if fmt not in ("json", "markdown", "md"):
+                fmt = "markdown"
+        
+        if not sid:
+            sessions = self.conv_store.list_sessions(limit=10)
+            if not sessions:
+                print("💬 暂无历史会话")
+                return True
+            options = [
+                _pick.Option(
+                    f"{s['id']}  {s['model']}  💬{s.get('turn_count', 0)}轮",
+                    s["id"],
+                )
+                for s in sessions
+            ]
+            options.append(_pick.Option("取消", "__cancel__"))
+            try:
+                selected, _ = _pick.pick(
+                    options,
+                    "📤 选择要导出的会话（↑↓ 移动，Enter 确认）：",
+                    indicator="❯",
+                )
+            except KeyboardInterrupt:
+                return True
+            if selected.value == "__cancel__":
+                return True
+            sid = selected.value
+        
+        # 导出会话
+        ext = "json" if fmt == "json" else "md"
+        output_path = self._export_dir / f"session_{sid}.{ext}"
+        
+        success = self.conv_store.export_session_to_file(sid, output_path, fmt)
+        
+        if success:
+            print(f"✅ 会话已导出到：{output_path}")
+        else:
+            print(f"❌ 导出失败，会话 [{sid}] 不存在")
+        return True
+    
+    def _handle_tools(self, cmd: str) -> bool:
+        """搜索使用过指定工具的会话"""
+        parts = cmd.split(maxsplit=2)
+        tool_name = parts[2].strip() if len(parts) > 2 else ""
+        
+        if not tool_name:
+            tool_name = input("🔧 输入工具名称：").strip()
+        
+        if not tool_name:
+            print("⚠️ 请输入工具名称")
+            return True
+        
+        results = self.conv_store.search_by_tool(tool_name)
+        
+        if not results:
+            print(f"🔧 未找到使用过「{tool_name}」的会话")
+            return True
+        
+        print(f"🔧 找到 {len(results)} 个使用过「{tool_name}」的会话：\n")
+        for i, s in enumerate(results[:10], 1):
+            print(f"   {i}. [{s['id']}]")
+            print(f"      📅 {s['started_at']}  💬 {s.get('turn_count', 0)} 轮")
+            print(f"      🔧 使用次数：{s.get('tool_usage_count', 0)}")
+            print()
+        return True
 
     def _print_help(self) -> None:
         """打印帮助信息"""
         print("💬 会话记录命令：")
-        print("   /history            - 列出最近会话")
-        print("   /history show       - 选择并查看会话详情（上下键选择）")
-        print("   /history show <ID>  - 查看指定会话详情（含调用链）")
-        print("   /history resume     - 恢复历史会话并继续对话（上下键选择）")
-        print("   /history delete     - 删除指定会话（上下键选择）")
-        print("   /history clear      - 清空所有历史会话")
-        print("   /history stats      - 查看会话统计")
+        print("   /history               - 列出最近会话")
+        print("   /history show         - 选择并查看会话详情（上下键选择）")
+        print("   /history show <ID>     - 查看指定会话详情（含调用链）")
+        print("   /history resume        - 恢复历史会话并继续对话")
+        print("   /history delete        - 删除指定会话")
+        print("   /history clear         - 清空所有历史会话")
+        print("   /history stats         - 查看会话统计")
+        print("   /history search [关键词] - 搜索会话内容")
+        print("   /history export [ID]   - 导出会话（支持 format=json/markdown）")
+        print("   /history tools [工具名] - 搜索使用过指定工具的会话")

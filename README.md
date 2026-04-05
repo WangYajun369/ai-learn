@@ -4,26 +4,51 @@
 
 ## ✨ 核心特性
 
-- **🔧 MCP 工具调用**：基于 FastMCP 实现标准化工具协议，支持多步工具链调用
+- **🔧 MCP 工具调用**：基于 FastMCP 实现标准化工具协议，支持多步工具链调用、连接重试机制
 - **📦 渐进式 Skill 加载**：三阶段按需加载（摘要→完整指令→脚本/模板），最小化 Token 消耗
-- **🧠 三层记忆系统**：
+- **🧠 四层记忆系统**：
   - **向量记忆**（ChromaDB）：跨会话语义检索，自动摘要存储
   - **会话记录**（SQLite）：完整对话回溯，工具调用链追踪（含耗时）
   - **进化式记忆**（用户画像 + 假设队列）：Agent 自我进化，学习用户偏好和约束
+  - **工具缓存**（TTL + LRU）：相同查询秒级响应，命中率统计
 - **🤖 多模型支持**：通义千问、智谱 GLM、Ollama 本地模型，统一后端抽象接口
-- **💻 交互式界面**：REPL 终端模式，支持流式输出和命令补全
+- **💻 交互式界面**：REPL 终端模式，支持流式输出、命令补全和模型热切换
 
 ## 🏗️ 架构
 
 ```
 用户终端（自然语言）
     ↓
-agent.py（MCP Client + Skill Engine + LLM Backend + 三层记忆系统）
+agent.py（MCP Client + Skill Engine + LLM Backend + 四层记忆系统）
     ↓ stdio                                    ↕ ChromaDB          ↕ SQLite
 server.py（MCP Server — 5 个销售数据工具）     memory_db/（长期记忆） conversations.db（会话记录）
     ↓                                                       ↕
-sales.db（SQLite — 52 条 Q2 销售记录）                user_profile.db（用户画像 + 假设）
+sales.db（SQLite — 52 条 Q2 销售记录）        user_profile.db（用户画像 + 假设）
 ```
+
+### 工具调用缓存
+
+基于 TTL + LRU 的高效缓存机制：
+
+- **自动缓存**：相同工具调用结果自动缓存
+- **可配置 TTL**：默认 5 分钟过期（可在 config.yaml 中调整）
+- **LRU 淘汰**：超出容量时自动淘汰最少使用条目
+- **命中统计**：实时显示缓存命中率
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `cache.ttl_seconds` | 300 | 缓存过期时间（秒） |
+| `cache.max_size` | 1000 | 最大缓存条目数 |
+| `cache.enabled` | true | 是否启用缓存 |
+
+### MCP 连接重试
+
+智能重试机制，确保服务稳定性：
+
+- **指数退避**：1s → 2s → 4s，避免惊群效应
+- **随机抖动**：±25% 随机偏移，分散重试请求
+- **智能检测**：自动识别可重试的错误类型
+- **可配置参数**：最大重试次数、基础延迟、最大延迟
 
 ### 长期记忆（向量数据库）
 
@@ -34,17 +59,10 @@ sales.db（SQLite — 52 条 Q2 销售记录）                user_profile.db�
 - **手动管理**：通过 `/memory` 命令查看、搜索、清空记忆
 - **存储位置**：`./object_db/memory_db/`（ChromaDB 持久化目录）
 
-| 命令 | 说明 |
-|------|------|
-| `/memory list` | 列出最近 10 条记忆 |
-| `/memory search <关键词>` | 语义搜索相关记忆 |
-| `/memory delete <记忆ID>` | 删除指定记忆 |
-| `/memory clear` | 清空所有记忆 |
-| `/memory stats` | 查看记忆统计信息 |
-
 ### 进化式记忆（用户画像）
 
 Agent 自我进化能力，存储于 `./object_db/user_profile.db`：
+
 - **UserProfileStore**：持久化用户画像（偏好/约束/工作流）
 - **HypothesisStore**：管理待确认的假设约束队列
 - **Observer**：观察每轮对话，提取用户行为信号
@@ -60,16 +78,10 @@ Agent 自我进化能力，存储于 `./object_db/user_profile.db`：
 - **自动记录**：实时保存用户问题、Agent 回复、工具调用链（含耗时）
 - **会话管理**：启动自动恢复上次会话，`/new` 创建新会话
 - **调用链追踪**：记录每次工具调用的名称、参数、返回结果、耗时（ms）
+- **会话导出**：支持 JSON/Markdown 格式导出
+- **会话搜索**：按关键词搜索历史会话内容
+- **工具追踪**：搜索使用过特定工具的会话
 - **存储位置**：`./object_db/conversations.db`（SQLite WAL 模式）
-
-| 命令 | 说明 |
-|------|------|
-| `/history` | 列出最近 10 个会话 |
-| `/history show <会话ID>` | 查看会话详情（完整对话 + 工具调用链） |
-| `/history resume <会话ID>` | 恢复到指定会话继续对话 |
-| `/history delete <会话ID>` | 删除指定会话 |
-| `/history clear` | 清空所有会话记录 |
-| `/history stats` | 查看会话统计信息 |
 
 ### Skill 包结构（渐进式加载）
 
@@ -99,6 +111,14 @@ uv sync
 # 配置 API Key
 cp .env.example .env
 # 编辑 .env 文件，填入你的 API Key
+```
+
+### 配置（可选）
+
+```bash
+# 复制配置文件
+cp config.yaml.example config.yaml
+# 按需修改配置（缓存TTL、重试策略等）
 ```
 
 ### 运行
@@ -143,23 +163,21 @@ uv run server.py
 ```
 
 ```
-👤 你：/history show 20260404_203500
-══════════════════════════════════════════════════════
-  会话 [20260404_203500]  模型：qwen-max
-  📅 2026-04-04T20:35:00 → 2026-04-04T20:38:00
-  💬 3 轮对话
-══════════════════════════════════════════════════════
+👤 你：/history search 华东
+🔍 找到 3 个匹配的会话：
+   1. [20260405_100100]  💬 5 轮
+      💬 分析华东区销售额，与华南区对比...
+   2. [20260404_203500]  💬 3 轮
+      💬 华东区域 Q2 数据概览...
+```
 
-📝 对话记录：
-  👤 用户：分析华东区的销售表现
-  🤖 Agent：📊 华东区销售分析报告...
-
-🔧 工具调用链（2 次）：
-  → query_sales_by_region({"region": "华东"})  ⏱ 45ms
-    返回：[{"product": "AI 助手基础版", "month": "4月", "sales": 45000}, ...]
-  → query_sales_by_region({"region": "华南"})  ⏱ 32ms
-    返回：[{"product": "AI 助手基础版", "month": "4月", "sales": 38000}, ...]
-══════════════════════════════════════════════════════
+```
+👤 你：/history export
+📤 选择要导出的会话：
+   ❯ 20260405_100100  通义千问  💬5轮
+     20260404_203500  智谱 GLM  💬3轮
+     ...
+✅ 会话已导出到：./exports/session_20260405_100100.md
 ```
 
 ```
@@ -217,20 +235,33 @@ ollama pull qwen2.5:7b
 ollama serve
 ```
 
-## ⚙️ 环境变量
+## ⚙️ 配置管理
 
-在 `.env` 文件中配置：
+项目支持 YAML 配置文件（`config.yaml`），覆盖默认设置：
 
-```env
-# 通义千问（阿里云 DashScope）
-DASHSCOPE_API_KEY=sk-xxx
+```yaml
+# 数据库配置
+database:
+  pool_size: 5              # 连接池大小
+  pool_timeout: 30           # 连接超时（秒）
 
-# 智谱 GLM（BigModel）
-BIGMODEL_API_KEY=xxx
+# MCP Server 配置
+mcp_server:
+  retry_max_attempts: 3      # 最大重试次数
+  retry_base_delay: 1.0     # 基础延迟（秒）
+  retry_max_delay: 10.0     # 最大延迟（秒）
+  timeout: 30.0             # 连接超时（秒）
 
-# Ollama 本地模型（可选）
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=qwen2.5:7b
+# 缓存配置
+cache:
+  enabled: true              # 是否启用缓存
+  ttl_seconds: 300          # 缓存 TTL（秒）
+  max_size: 1000            # 最大缓存条目数
+
+# 会话配置
+session:
+  export_dir: ./exports      # 会话导出目录
+  max_history_display: 10    # 历史会话列表显示数量
 ```
 
 ## 📁 项目结构
@@ -241,14 +272,22 @@ OLLAMA_MODEL=qwen2.5:7b
 ├── agent/
 │   ├── core.py             # Agent 核心：对话循环、工具调用、流式输出
 │   ├── skill_loader.py     # 渐进式 Skill 加载器
+│   ├── memory_injector.py  # 向量记忆 + 用户画像注入/保存
+│   ├── evolution_handler.py # 进化引擎命令处理
+│   ├── command_dispatcher.py # 斜杠命令定义、补全和分发
+│   ├── retry.py            # MCP 连接重试机制
+│   ├── cache.py             # 工具调用缓存（TTL + LRU）
+│   ├── config.py            # 配置管理（YAML + 环境变量）
+│   ├── log.py               # 统一日志系统
 │   ├── backends/           # LLM 后端实现
-│   │   ├── base.py         # 统一后端抽象接口
+│   │   ├── base.py         # BaseBackend 抽象基类
+│   │   ├── openai_compat.py # OpenAI 兼容后端（GLM/Ollama 共享）
 │   │   ├── qwen.py         # 通义千问后端
 │   │   ├── glm.py          # 智谱 GLM 后端
 │   │   └── ollama.py       # Ollama 本地模型后端
 │   ├── commands/           # 斜杠命令处理器
 │   │   ├── memory.py       # /memory 命令
-│   │   └── history.py      # /history 命令
+│   │   └── history.py      # /history 命令（增强版）
 │   └── evolution/          # 进化式记忆模块
 │       ├── engine.py       # 进化引擎：协调观察→总结→进化
 │       ├── observer.py     # 观察者：提取用户行为信号
@@ -256,8 +295,9 @@ OLLAMA_MODEL=qwen2.5:7b
 │       └── hypothesis.py   # HypothesisStore：待确认假设管理
 ├── server.py               # MCP Server（FastMCP，5 个销售工具）
 ├── memory_store.py         # ChromaDB 向量记忆封装
-├── conversation_store.py   # SQLite 会话记录封装
+├── conversation_store.py   # SQLite 会话记录封装（增强版）
 ├── init_db.py              # 销售数据库初始化（52 条测试数据）
+├── config.yaml.example     # 配置文件模板
 ├── sales-analysis/         # Skill 技能包
 │   ├── SKILL.md            # 技能定义（元数据 + 执行流程 + 输出规范）
 │   ├── scripts/            # 分析脚本（指标计算、异常检测）
@@ -267,6 +307,7 @@ OLLAMA_MODEL=qwen2.5:7b
 │   ├── memory_db/          # ChromaDB 向量记忆持久化
 │   ├── conversations.db    # 会话记录与工具调用链
 │   └── user_profile.db     # 用户画像与假设约束
+├── exports/                # 会话导出目录（自动创建）
 ├── pyproject.toml          # 项目依赖配置
 └── README.md               # 本文件
 ```
@@ -290,10 +331,16 @@ OLLAMA_MODEL=qwen2.5:7b
 | `/new` | 创建新会话 |
 | `/history` | 列出最近的会话记录 |
 | `/history show` | 选择并查看会话详情（上下键选择） |
+| `/history show <ID>` | 查看指定会话详情（含调用链） |
 | `/history resume` | 恢复历史会话并继续对话（上下键选择） |
 | `/history delete` | 删除指定会话（上下键选择） |
 | `/history clear` | 清空所有历史会话 |
 | `/history stats` | 查看会话统计 |
+| `/history search [关键词]` | 搜索会话内容 |
+| `/history export [ID]` | 导出会话（支持 JSON/Markdown） |
+| `/history export [ID] format=json` | 导出为 JSON 格式 |
+| `/history export [ID] format=markdown` | 导出为 Markdown 格式 |
+| `/history tools [工具名]` | 搜索使用过指定工具的会话 |
 
 ### 用户画像进化
 
@@ -304,6 +351,15 @@ OLLAMA_MODEL=qwen2.5:7b
 | `/profile clear` | 清空用户画像 |
 | `/hypothesis` | 查看待确认假设 |
 | `/hypothesis clear` | 清空所有假设 |
+
+### 模型切换
+
+| 命令 | 说明 |
+|------|------|
+| `/model` | 显示当前模型和可用模型列表 |
+| `/model qwen` | 切换到通义千问 |
+| `/model glm` | 切换到智谱 GLM |
+| `/model ollama` | 切换到 Ollama |
 
 ### 其他
 
@@ -321,10 +377,12 @@ OLLAMA_MODEL=qwen2.5:7b
 - **阶段 3**：执行时按需加载 scripts/ 或 references/，代码不暴露给模型
 
 ### Backend 抽象层
-统一接口 `BaseBackend`（`agent/backends/base.py`）：
+统一接口 `BaseBackend`，支持多后端扩展：
 - `build_tools()` - 将 MCP 工具转换为后端特定格式
 - `chat()` / `chat_stream()` - 同步/流式对话
 - `make_tool_call_raw_message()` / `make_tool_result_message()` - 工具调用消息构造
+- `OpenAICompatibleBackend` - GLM/Ollama 共享实现
+- `QwenBackend` - 通义千问独立 API
 
 ### Skill-Tool 协同
 SKILL.md 定义业务流程和工具调用顺序，scripts/ 负责计算逻辑，references/ 提供输出模板。
@@ -337,6 +395,16 @@ SKILL.md 定义业务流程和工具调用顺序，scripts/ 负责计算逻辑�
 - **画像注入**：每轮对话前自动将用户画像注入 system prompt
 - **假设提示**：根据用户输入触发相关假设提示，用户可确认/拒绝
 - **深度分析**：`/evolve` 命令综合分析整个会话，批量更新画像
+
+### MCP 连接稳定性
+- **MCPSessionManager**：会话管理器，封装重试逻辑
+- **指数退避**：自动延迟重试，避免雪崩
+- **智能重试**：自动识别可重试的错误类型
+
+### 工具调用缓存
+- **TTL 过期**：默认 5 分钟自动过期
+- **LRU 淘汰**：超出容量时自动清理
+- **缓存统计**：实时追踪命中率和性能
 
 ## 📄 License
 

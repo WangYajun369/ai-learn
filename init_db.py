@@ -2,14 +2,6 @@ import sqlite3
 import os
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "object_db", "sales.db")
-conn = sqlite3.connect(DB_PATH)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS sales_records
-             (id INTEGER PRIMARY KEY, product_name TEXT,
-              region TEXT, amount REAL, sale_date TEXT)''')
-
-# 清空旧数据，重新插入更丰富的测试数据
-c.execute("DELETE FROM sales_records")
 
 data = [
     # AI 助手专业版 - Q2 数据（4-6月）
@@ -73,7 +65,20 @@ data = [
     (52, '数据分析套件', '华南', 28000.0, '2024-06-20'),
 ]
 
-c.executemany("INSERT OR IGNORE INTO sales_records VALUES (?, ?, ?, ?, ?)", data)
-conn.commit()
-conn.close()
-print("✅ 销售测试数据库已生成（含 52 条 Q2 销售记录，覆盖 5 个产品 × 3 个区域）")
+
+def init_db():
+    """初始化销售测试数据库（52 条 Q2 测试数据）"""
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS sales_records
+                     (id INTEGER PRIMARY KEY, product_name TEXT,
+                      region TEXT, amount REAL, sale_date TEXT)''')
+        c.execute("DELETE FROM sales_records")
+        c.executemany("INSERT OR IGNORE INTO sales_records VALUES (?, ?, ?, ?, ?)", data)
+        conn.commit()
+
+    print("✅ 销售测试数据库已生成（含 52 条 Q2 销售记录，覆盖 5 个产品 × 3 个区域）")
+
+
+if __name__ == "__main__":
+    init_db()

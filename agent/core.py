@@ -1,9 +1,21 @@
 """
 Agent 核心逻辑 - 对话循环、工具调用、流式输出
+
+重构后的 AgentCore 作为协调器，将职责拆分到专职组件：
+- MemoryInjector: 向量记忆 + 用户画像注入/保存
+- EvolutionHandler: 进化引擎命令处理
+- CommandDispatcher: 斜杠命令定义、补全和分发
+
+增强功能：
+- MCP 连接重试机制（指数退避）
+- 工具调用缓存（TTL 5分钟）
+- 会话导出（JSON/Markdown）
+- 会话搜索
 """
 
 import asyncio
 import os
+import queue
 import re
 import sys
 import threading
@@ -12,8 +24,7 @@ from pathlib import Path
 from contextlib import AsyncExitStack
 
 from prompt_toolkit.shortcuts import PromptSession
-from prompt_toolkit.completion import Completer
-from prompt_toolkit.document import Document
+
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession
 
@@ -22,56 +33,19 @@ from conversation_store import ConversationStore
 
 from .skill_loader import SkillLoader
 from .backends.base import BaseBackend
+from .backends import BACKENDS, BACKEND_LABELS, get_backend, get_backend_label
 from .commands.memory import MemoryCommandHandler
 from .commands.history import HistoryCommandHandler
 from .evolution.engine import EvolutionEngine
-
-
-# 斜杠命令定义
-SLASH_COMMANDS = [
-    ("/new", "创建新会话"),
-    ("/evolve", "🧬 主动总结归纳（深度分析用户画像）"),
-    ("/profile", "🧬 查看当前用户画像"),
-    ("/profile clear", "清空用户画像"),
-    ("/hypothesis", "💡 查看待确认假设"),
-    ("/hypothesis clear", "清空所有假设"),
-    ("/memory list", "列出最近 10 条记忆"),
-    ("/memory search", "语义搜索记忆（需跟关键词）"),
-    ("/memory delete", "删除指定会话的记忆"),
-    ("/memory clear", "清空所有记忆"),
-    ("/memory stats", "查看记忆统计"),
-    ("/history", "列出最近的会话记录"),
-    ("/history show", "选择并查看会话详情（上下键选择）"),
-    ("/history resume", "恢复历史会话并继续对话（上下键选择）"),
-    ("/history delete", "删除指定会话（上下键选择）"),
-    ("/history clear", "清空所有历史会话"),
-    ("/history stats", "查看会话统计"),
-    ("/help", "显示所有命令帮助"),
-    ("/exit", "退出程序"),
-]
-
-
-class SlashCommandCompleter(Completer):
-    """斜杠命令补全器"""
-
-    def get_completions(self, document: Document, complete_event):
-        text_before_cursor = document.text_before_cursor.lstrip()
-        if not text_before_cursor.startswith("/"):
-            return
-        from prompt_toolkit.completion import Completion
-        word = text_before_cursor.lower()
-        for cmd, desc in SLASH_COMMANDS:
-            if cmd.lower().startswith(word):
-                yield Completion(
-                    cmd,
-                    start_position=-len(text_before_cursor),
-                    display=cmd,
-                    display_meta=desc,
-                )
+from .memory_injector import MemoryInjector
+from .evolution_handler import EvolutionHandler
+from .command_dispatcher import SlashCommandCompleter, SLASH_COMMANDS
+from .retry import MCPSessionManager, RetryError
+from .cache import get_tool_cache
 
 
 class AgentCore:
-    """Agent 核心类，管理对话循环、工具调用和状态"""
+    """Agent 核心协调器，管理对话主循环和各子组件"""
 
     def __init__(
         self,
@@ -81,44 +55,54 @@ class AgentCore:
         conv_store: ConversationStore,
     ):
         self.backend = backend
+        self.backend_name = ""  # 当前模型名称，切换时更新
         self.skill_loader = skill_loader
         self.memory_store = memory_store
         self.conv_store = conv_store
 
-        self.memory_enabled = False
+        # 对话状态
         self.conv_enabled = False
-        self.session_id = ""
         self.conv_session_id = ""
+        self.session_id = ""
         self.turn_count = 0
         self.messages: list[dict] = []
         self.active_skill: dict | None = None
         self.base_system_prompt = ""
 
-        # 命令处理器
-        self.memory_handler: MemoryCommandHandler | None = None
-        self.history_handler: HistoryCommandHandler | None = None
-
-        # 进化引擎
+        # 子组件（initialize 时创建）
+        self.memory_injector: MemoryInjector | None = None
+        self.evo_handler: EvolutionHandler | None = None
+        self._memory_cmd_handler: MemoryCommandHandler | None = None
+        self._history_cmd_handler: HistoryCommandHandler | None = None
         self.evolution: EvolutionEngine | None = None
 
     async def initialize(self) -> bool:
-        """初始化 Agent，连接数据库和加载配置"""
-        # 连接记忆数据库
-        self.memory_enabled = self.memory_store.connect()
+        """初始化 Agent，连接数据库和创建子组件"""
+        # 创建记忆注入器
+        self.memory_injector = MemoryInjector(self.memory_store)
+        self.memory_injector.memory_enabled = self.memory_store.connect()
         self.session_id = generate_memory_id()
 
         # 连接会话记录数据库
         self.conv_enabled = self.conv_store.connect()
 
-        # 连接进化引擎（用户画像 + 假设队列）
+        # 初始化进化引擎
         self.evolution = EvolutionEngine()
         self.evolution.connect(silent=True)
+        self.memory_injector.evolution = self.evolution
+
+        # 创建进化命令处理器
+        self.evo_handler = EvolutionHandler(self.evolution)
 
         # 初始化命令处理器
-        self.memory_handler = MemoryCommandHandler(self.memory_store, self.memory_enabled)
-        self.history_handler = HistoryCommandHandler(self.conv_store, self.conv_enabled)
+        self._memory_cmd_handler = MemoryCommandHandler(
+            self.memory_store, self.memory_injector.memory_enabled
+        )
+        self._history_cmd_handler = HistoryCommandHandler(self.conv_store, self.conv_enabled)
 
         return True
+
+    # ── 会话恢复 ──
 
     def restore_or_create_session(self, backend_name: str) -> list[dict]:
         """恢复最近一次会话或创建新会话"""
@@ -131,7 +115,6 @@ class AgentCore:
                 last_status = recent[0].get("status", "closed")
                 restored_messages = self.conv_store.restore_session_messages(last_sid)
 
-                # 无论是否有消息，都恢复会话（即使上次异常退出）
                 self.conv_session_id = last_sid
                 self.conv_store.switch_to_session(last_sid)
 
@@ -140,11 +123,12 @@ class AgentCore:
                 else:
                     print(f"🔄 检测到上次会话 [{last_sid}]（{last_status}，无历史消息）")
             else:
-                # 没有历史会话，创建新会话
                 self.conv_session_id = self.conv_store.create_session(backend_name)
                 print(f"🆕 已创建新会话 [{self.conv_session_id}]")
 
         return restored_messages
+
+    # ── 系统提示词 ──
 
     def setup_system_prompt(self, tools_resp) -> None:
         """设置系统提示词"""
@@ -157,6 +141,8 @@ class AgentCore:
             "回复使用中文。"
         )
         self.messages = [{"role": "system", "content": self.base_system_prompt}]
+
+    # ── 显示信息 ──
 
     def print_skill_packages(self) -> None:
         """打印已加载的技能包信息"""
@@ -176,7 +162,6 @@ class AgentCore:
             if s.get("trigger_keywords"):
                 kw_str = ", ".join(s["trigger_keywords"])
                 print(f"   │  触发词：{kw_str}")
-            # 列出附带的脚本和参考文件
             scripts_dir = self.skill_loader.skills_dir / "scripts"
             refs_dir = self.skill_loader.skills_dir / "references"
             if scripts_dir.exists():
@@ -200,11 +185,10 @@ class AgentCore:
         self.turn_count = sum(1 for m in restored_messages if m["role"] == "user")
         print(f"   ✅ 已加载 {self.turn_count} 轮历史对话")
 
-        # 打印历史对话内容
         print("\n" + "═" * 60, flush=True)
         print("📜 历史对话记录", flush=True)
         print("═" * 60, flush=True)
-        for i, msg in enumerate(restored_messages):
+        for msg in restored_messages:
             role = msg["role"]
             content = msg["content"]
             ts = msg.get("created_at", "")
@@ -213,166 +197,35 @@ class AgentCore:
                 print(f"\n👤 用户：{content}{ts_str}", flush=True)
             elif role == "assistant":
                 print(f"\n🤖 Agent：{content}{ts_str}", flush=True)
-            # 每轮对话（用户+助手）后加分隔线
             if role == "assistant":
                 print("\n" + "-" * 47, flush=True)
         print("═" * 60, flush=True)
         print("   输入 /new 可创建新会话\n", flush=True)
 
-    def inject_memory(self, user_input: str) -> None:
-        """根据用户输入检索相关记忆，注入到 system prompt"""
-        # ── 注入向量记忆 ──
-        if not self.memory_enabled or not self.memory_store._collection:
-            pass
-        else:
-            count = self.memory_store._collection.count()
-            if count > 0:
-                related = self.memory_store.search(user_input, n_results=3)
-                if related:
-                    memory_lines = ["以下是相关的历史记忆（供参考）："]
-                    for i, m in enumerate(related, 1):
-                        ts = m["metadata"].get("timestamp", "")
-                        memory_lines.append(f"  {i}. [{ts}] {m['content']}")
-                    memory_text = "\n".join(memory_lines)
-                    current_system = self.messages[0]["content"]
-                    self.messages[0] = {
+    # ── 技能匹配 ──
+
+    def try_match_skill(self, user_input: str) -> bool:
+        """尝试匹配并加载技能"""
+        matched = self.skill_loader.match_skill(user_input) if self.skill_loader.skills else None
+        if matched and self.active_skill is None:
+            print(f"\n📦 匹配到技能包：{matched['name']}")
+            full_skill = self.skill_loader.load_full_skill(matched["name"])
+            if full_skill:
+                self.active_skill = matched
+                self.messages[0] = {"role": "system", "content": full_skill}
+                print("   ✅ 技能指令已加载（完整 SKILL.md）")
+
+                template = self.skill_loader.load_reference("report_template.md")
+                if template:
+                    self.messages.append({
                         "role": "system",
-                        "content": current_system + "\n\n" + memory_text,
-                    }
-                    print("   🧠 已检索到相关历史记忆")
+                        "content": f"以下是你的报告输出模板，请严格按照此格式生成报告：\n\n{template}",
+                    })
+                    print("   ✅ 报告模板已加载（references/report_template.md）")
+            return True
+        return False
 
-        # ── 注入用户画像 ──
-        if self.evolution and self.evolution.enabled:
-            profile_text = self.evolution.get_profile_for_prompt()
-            if profile_text:
-                current_system = self.messages[0]["content"]
-                self.messages[0] = {
-                    "role": "system",
-                    "content": current_system + "\n\n" + profile_text,
-                }
-                print("   🧬 已注入用户画像")
-
-    def save_memory(self, silent: bool = False) -> None:
-        """调用 LLM 生成对话摘要并存入向量数据库"""
-        if not self.memory_enabled or not self.memory_store._collection:
-            return
-        if self.turn_count < 1:
-            # 对话轮次太少，不保存
-            return
-
-        try:
-            summary_prompt = MemoryStore.build_summary_prompt(self.messages)
-            # 用一个轻量级调用让 LLM 生成摘要
-            summary_messages = [
-                {"role": "system", "content": "你是信息提取助手。只输出摘要文本，不要加任何前缀后缀。"},
-                {"role": "user", "content": summary_prompt},
-            ]
-            result = self.backend.chat(summary_messages, [])
-            summary = result.get("content", "").strip()
-
-            if not summary or summary in ("无", "无。", "没有需要记住的信息。"):
-                return
-
-            # 提取话题标签
-            topics = self._extract_topics(self.messages)
-            self.memory_store.save(summary, self.session_id, topics)
-        except Exception as e:
-            if not silent:
-                print(f"   ⚠️ 记忆保存失败：{e}")
-
-    def _extract_topics(self, msgs: list[dict]) -> list[str]:
-        """从对话中提取简单的话题标签"""
-        topics = set()
-        for msg in msgs:
-            content = msg.get("content", "")
-            for keyword in [
-                "华东", "华北", "华南", "AI 助手", "数据分析",
-                "增长", "异常", "销售额", "客户管理", "智能客服",
-            ]:
-                if keyword in content:
-                    topics.add(keyword)
-        return sorted(topics)
-
-    # ── 进化引擎相关方法 ──
-
-    def _background_observe(self, user_input: str, assistant_reply: str) -> None:
-        """后台执行进化观察（不阻塞主对话循环）"""
-        try:
-            self.evolution.observe_and_evolve(
-                user_input=user_input,
-                assistant_reply=assistant_reply,
-                backend=self.backend,
-                silent=True,
-            )
-        except Exception as e:
-            print(f"\n   ⚠️ 进化观察异常：{e}")
-
-    async def _handle_evolve(self) -> None:
-        """处理 /evolve 命令：综合分析会话，更新用户画像"""
-        if not self.evolution or not self.evolution.enabled:
-            print("⚠️ 进化引擎不可用")
-            return
-        if self.turn_count < 2:
-            print("💡 对话轮次太少（至少需要 2 轮），暂无法进行深度分析")
-            return
-
-        print("\n🧬 正在深度分析对话历史，归纳用户画像...", flush=True)
-        result = self.evolution.deep_evolve(self.messages, self.backend)
-
-        if "error" in result:
-            print(f"⚠️ 分析失败：{result['error']}")
-            return
-
-        stats = result.get("stats", {})
-        print(f"\n🧬 分析完成！")
-        print(f"   📌 总结：{result.get('summary', '无')}")
-        print(f"   🏷️ 新增偏好：{stats.get('preferences', 0)} 条")
-        print(f"   📐 新增约束：{stats.get('constraints', 0)} 条")
-        print(f"   🔄 新增工作流：{stats.get('workflows', 0)} 条")
-
-        # 显示完整画像
-        print(self.evolution.profile_store.format_for_display())
-
-    def _handle_show_profile(self) -> None:
-        """处理 /profile 命令：显示用户画像"""
-        if not self.evolution or not self.evolution.enabled:
-            print("⚠️ 进化引擎不可用")
-            return
-        print("\n🧬 当前用户画像：")
-        print("═" * 60)
-        print(self.evolution.profile_store.format_for_display())
-        print("═" * 60)
-
-    def _handle_clear_profile(self) -> None:
-        """处理 /profile clear 命令：清空用户画像"""
-        if not self.evolution or not self.evolution.enabled:
-            print("⚠️ 进化引擎不可用")
-            return
-        count = self.evolution.profile_store.clear_all()
-        print(f"\n🧬 已清空 {count} 条画像数据")
-
-    def _handle_show_hypotheses(self) -> None:
-        """处理 /hypothesis 命令：显示待确认假设"""
-        if not self.evolution or not self.evolution.enabled:
-            print("⚠️ 进化引擎不可用")
-            return
-        print("\n💡 假设队列：")
-        print("═" * 60)
-        print(self.evolution.hypothesis_store.format_for_display())
-        print("═" * 60)
-        print("\n提示：对假设提示回复「是」确认，回复「否」拒绝")
-
-    def _handle_clear_hypotheses(self) -> None:
-        """处理 /hypothesis clear 命令：清空所有假设"""
-        if not self.evolution or not self.evolution.enabled:
-            print("⚠️ 进化引擎不可用")
-            return
-        pending = self.evolution.hypothesis_store.get_stats()["pending"]
-        # 软删除所有 pending 假设
-        all_pending = self.evolution.hypothesis_store.get_pending(limit=100)
-        for item in all_pending:
-            self.evolution.hypothesis_store.reject_hypothesis(item["id"])
-        print(f"\n💡 已清空 {len(all_pending)} 条待确认假设")
+    # ── 会话管理命令 ──
 
     def handle_new_session(self, backend_name: str) -> None:
         """处理 /new 命令创建新会话"""
@@ -381,7 +234,6 @@ class AgentCore:
             new_sid = self.conv_store.create_session(backend_name)
         else:
             new_sid = generate_memory_id()
-        # 重置为 base_system_prompt（不含画像/记忆注入，下次对话时重新注入）
         self.messages = [{"role": "system", "content": self.base_system_prompt}]
         self.active_skill = None
         self.turn_count = 0
@@ -396,151 +248,130 @@ class AgentCore:
             print(f"  {cmd:<20} - {desc}")
         print("═" * 60)
 
-    def try_match_skill(self, user_input: str) -> bool:
-        """尝试匹配并加载技能"""
-        matched = self.skill_loader.match_skill(user_input) if self.skill_loader.skills else None
-        if matched and self.active_skill is None:
-            print(f"\n📦 匹配到技能包：{matched['name']}")
-            full_skill = self.skill_loader.load_full_skill(matched["name"])
-            if full_skill:
-                # 阶段 2：加载完整 SKILL.md（<5000 tokens）
-                self.active_skill = matched
-                self.messages[0] = {
-                    "role": "system",
-                    "content": full_skill,
-                }
-                print("   ✅ 技能指令已加载（完整 SKILL.md）")
+    def handle_model_switch(self, user_input: str, backend_name: str) -> str | None:
+        """
+        处理 /model 命令切换大模型。
 
-                # 同时加载报告模板作为参考
-                template = self.skill_loader.load_reference("report_template.md")
-                if template:
-                    self.messages.append({
-                        "role": "system",
-                        "content": f"以下是你的报告输出模板，请严格按照此格式生成报告：\n\n{template}",
-                    })
-                    print("   ✅ 报告模板已加载（references/report_template.md）")
-            return True
-        return False
+        Returns:
+            None: 命令已处理，继续当前会话
+            str: 新的 backend_name（需要切换模型）
+        """
+        # 解析命令参数
+        parts = user_input.strip().split()
+        target_model = parts[1] if len(parts) > 1 else None
+
+        # 无参数：显示当前模型和可用模型
+        if target_model is None:
+            current_label = BACKEND_LABELS.get(backend_name, backend_name)
+            print(f"\n🔄 当前模型：{current_label}")
+            print("\n📋 可用模型：")
+            for name, label in BACKEND_LABELS.items():
+                marker = " ◀ (当前)" if name == backend_name else ""
+                print(f"   - {name:<10} {label}{marker}")
+            print("\n💡 输入 /model <名称> 切换，如：/model glm")
+            return None
+
+        # 有参数：检查目标模型
+        if target_model not in BACKENDS:
+            print(f"\n❌ 未知模型：{target_model}")
+            print("可用模型：" + ", ".join(BACKENDS.keys()))
+            return None
+
+        # 相同模型
+        if target_model == backend_name:
+            print(f"\nℹ️ 已经是 {BACKEND_LABELS.get(target_model, target_model)}")
+            return None
+
+        # 切换模型
+        print(f"\n🔄 正在切换到 {BACKEND_LABELS.get(target_model, target_model)}...")
+        return target_model
+
+    # ── 流式响应处理 ──
 
     async def process_streaming_response(self, tools: list) -> tuple[str, list[dict], bool]:
         """
-        处理流式响应
-        
+        处理流式响应，使用 queue.Queue 实现线程安全的 chunk 传递
+
         Returns:
             (full_content, tool_calls, has_tool_call)
         """
+        _SENTINEL = object()
         cancelled = threading.Event()
-        _stream_error: list = [None]
-        _stream_chunks: list = []  # 线程安全的 chunk 队列
-        _stream_lock = threading.Lock()
-        _stream_done = threading.Event()
+        chunk_queue: queue.Queue = queue.Queue()
+        error_holder: list = [None]
 
         def _run_stream():
             try:
-                _stream_error[0] = None
                 for chunk_tuple in self.backend.chat_stream(self.messages, tools):
                     if cancelled.is_set():
                         break
-                    with _stream_lock:
-                        _stream_chunks.append(chunk_tuple)
-                    _stream_done.set()  # 有数据了，通知主线程开始打印
-                _stream_done.set()  # 流结束
+                    chunk_queue.put(chunk_tuple)
+                chunk_queue.put(_SENTINEL)
             except Exception as e:
-                _stream_error[0] = e
-                _stream_done.set()
+                error_holder[0] = e
+                chunk_queue.put(_SENTINEL)
 
         chat_thread = threading.Thread(target=_run_stream, daemon=True)
         print("   ⏳ 思考中…", end="", flush=True)
         chat_thread.start()
 
-        # 主线程：等待首个 chunk 到达 + 实时打印
         full_content = ""
         tool_calls = []
         has_tool_call = False
-        _printed_index = 0  # 已打印到的 chunk 位置
         first_chunk = True
-
-        # 去掉每行开头的空白，防止模型输出中累积的缩进空格
         _strip_line_re = re.compile(r"\n[ \t]+")
 
         try:
             while True:
-                # 等待有新数据或流结束
-                if not _stream_done.wait(timeout=0.05):
-                    # 超时，检查线程是否已结束且无新数据
-                    if not chat_thread.is_alive():
-                        # 线程已结束，再检查是否还有未打印的数据
-                        with _stream_lock:
-                            if _printed_index >= len(_stream_chunks):
-                                # 确实没有更多数据了，退出
-                                break
+                try:
+                    item = chunk_queue.get(timeout=0.05)
+                except queue.Empty:
                     continue
 
-                # 打印所有新到达的 chunks
-                while True:
-                    with _stream_lock:
-                        if _printed_index >= len(_stream_chunks):
-                            break
-                        chunk_tuple = _stream_chunks[_printed_index]
-                        _printed_index += 1
-
-                    content_delta, is_tc, tc_info = chunk_tuple
-                    if first_chunk:
-                        # 清除"思考中"提示，打印 Agent 标记
-                        print("\r" + " " * 30 + "\r", end="", flush=True)
-                        print("🤖 Agent：", end="", flush=True)
-                        first_chunk = False
-                        # 去掉开头换行，避免 Agent 标记后空一行
-                        content_delta = content_delta.lstrip("\n")
-
-                    # 记录原始内容
-                    full_content += content_delta
-
-                    # 显示时去掉每行开头的累积空格
-                    display_delta = _strip_line_re.sub("\n", content_delta)
-
-                    # 直接输出（确保 flush）
-                    if is_tc:
-                        has_tool_call = True
-                        tool_calls.append(tc_info)
-                        if display_delta:
-                            sys.stdout.write(display_delta)
-                            sys.stdout.flush()
-                    else:
-                        sys.stdout.write(display_delta)
-                        sys.stdout.flush()
-
-                # 检查是否有错误
-                if _stream_error[0] is not None:
+                if item is _SENTINEL:
                     break
 
-                # 如果线程已结束且 _stream_done 被设置，说明流已完成
-                if not chat_thread.is_alive() and _stream_done.is_set():
-                    # 再次确认没有未打印的数据
-                    with _stream_lock:
-                        if _printed_index >= len(_stream_chunks):
-                            break
+                content_delta, is_tc, tc_info = item
+                if first_chunk:
+                    print("\r" + " " * 30 + "\r", end="", flush=True)
+                    print("🤖 Agent：", end="", flush=True)
+                    first_chunk = False
+                    content_delta = content_delta.lstrip("\n")
+
+                full_content += content_delta
+                display_delta = _strip_line_re.sub("\n", content_delta)
+
+                if is_tc:
+                    has_tool_call = True
+                    tool_calls.append(tc_info)
+                    if display_delta:
+                        sys.stdout.write(display_delta)
+                        sys.stdout.flush()
+                else:
+                    sys.stdout.write(display_delta)
+                    sys.stdout.flush()
 
         except KeyboardInterrupt:
-            # 用户按 Ctrl+C 取消
             cancelled.set()
             print("\r   ⛔ 已取消回答")
             raise
 
-        if _stream_error[0] is not None:
-            raise _stream_error[0]
+        if error_holder[0] is not None:
+            raise error_holder[0]
 
         if first_chunk:
-            # 没有任何输出（模型可能返回空）
             print("\r" + " " * 30 + "\r", end="", flush=True)
         else:
-            print()  # 换行
+            print()
 
         return full_content, tool_calls, has_tool_call
 
-    async def run_conversation_loop(self, session, tools: list, backend_name: str) -> None:
+    # ── 对话主循环 ──
+
+    async def run_conversation_loop(self, session, tools: list, backend_name: str) -> str | None:
         """主对话循环"""
         pt_session = PromptSession(completer=SlashCommandCompleter())
+        mcp_manager = self._mcp_manager  # 从 run() 传入的会话管理器
 
         while True:
             try:
@@ -549,105 +380,87 @@ class AgentCore:
                 break
 
             user_input = user_input.strip()
-
             if not user_input:
                 continue
 
-            # ── 新会话命令 ──
+            # ── 会话管理命令 ──
             if user_input.strip().lower() in ("/new", "/new "):
                 self.handle_new_session(backend_name)
                 continue
 
-            # ── 帮助命令 ──
             if user_input.strip().lower() in ("/help", "/help ", "/?"):
                 self.handle_help()
                 continue
 
-            # ── 进化命令：/evolve ──
-            if user_input.strip().lower() in ("/evolve", "/evolve "):
-                await self._handle_evolve()
+            # ── 模型切换命令 ──
+            if user_input.strip().lower().startswith("/model"):
+                new_backend = self.handle_model_switch(user_input, backend_name)
+                if new_backend:
+                    # 需要切换模型，返回新模型名称让 run() 重新初始化
+                    return new_backend
                 continue
 
-            # ── 进化命令：/profile ──
+            # ── 进化命令 ──
+            if user_input.strip().lower() in ("/evolve", "/evolve "):
+                self.evo_handler.handle_evolve(self.messages, self.turn_count, self.backend)
+                continue
+
             if user_input.strip().lower() == "/profile":
-                self._handle_show_profile()
+                self.evo_handler.handle_show_profile()
                 continue
             if user_input.strip().lower() == "/profile clear":
-                self._handle_clear_profile()
+                self.evo_handler.handle_clear_profile()
                 continue
 
-            # ── 进化命令：/hypothesis ──
             if user_input.strip().lower() == "/hypothesis":
-                self._handle_show_hypotheses()
+                self.evo_handler.handle_show_hypotheses()
                 continue
             if user_input.strip().lower() == "/hypothesis clear":
-                self._handle_clear_hypotheses()
+                self.evo_handler.handle_clear_hypotheses()
                 continue
 
-            # ── 记忆管理命令 ──
-            if self.memory_handler and self.memory_handler.handle(user_input):
+            # ── 记忆/会话命令 ──
+            cmd_result = self._dispatch_subsystem_command(user_input)
+            if cmd_result is not None:
+                if isinstance(cmd_result, str):
+                    self._restore_session(cmd_result)
                 continue
 
-            # ── 会话记录命令 ──
-            history_result = self.history_handler.handle(user_input) if self.history_handler else False
-            if history_result is True or history_result is False:
-                if history_result:
-                    continue
-            elif isinstance(history_result, str):
-                # 返回了 session_id，执行恢复
-                restored = self.conv_store.restore_session_messages(history_result)
-                if restored:
-                    self.messages.extend(restored)
-                    # 统计恢复的用户消息数作为 turn_count
-                    self.turn_count = sum(1 for m in restored if m["role"] == "user")
-                    self.conv_store.switch_to_session(history_result)
-                    print(f"\n🔄 已恢复会话 [{history_result}]，共 {self.turn_count} 轮对话，可继续聊天")
-                else:
-                    print(f"⚠️ 会话 [{history_result}] 无可恢复的消息")
-                continue
-
+            # ── 退出 ──
             if user_input.lower() in ["exit", "quit", "/exit"]:
                 break
 
+            # ── 正常对话流程 ──
             self.turn_count += 1
 
-            # ── 检查用户对假设的确认/拒绝 ──
-            if self.evolution and self.evolution.enabled:
-                confirm_result = self.evolution.handle_user_confirmation(user_input)
+            # 检查用户对假设的确认/拒绝
+            if self.evo_handler.enabled:
+                confirm_result = self.evo_handler.check_confirmation(user_input)
                 if confirm_result:
                     print(f"\n🧬 {confirm_result}\n")
-                    # 确认/拒绝后，继续正常对话流程（不跳过）
 
-            # ── 检查待确认假设提示 ──
-            if self.evolution and self.evolution.enabled:
-                hint = self.evolution.get_hypothesis_hint(user_input)
-                if hint:
-                    print(f"\n{hint}\n")
-
-            # ── 检索相关记忆并注入（向量记忆 + 用户画像）──
-            self.inject_memory(user_input)
+            # 检索相关记忆、画像、假设提示（统一注入到 system prompt）
+            self.memory_injector.inject(user_input, self.messages)
 
             self.messages.append({"role": "user", "content": user_input})
 
-            # ── 记录用户消息 ──
+            # 记录用户消息
             if self.conv_enabled:
-                # 确保会话存在（防止清空历史后未创建新会话）
                 if not self.conv_store.session_id:
                     self.conv_session_id = self.conv_store.create_session(backend_name)
                     print(f"🆕 已创建新会话 [{self.conv_session_id}]")
                 self.conv_store.save_message("user", user_input)
 
-            # ── 阶段 1→2：技能匹配 ──
+            # 技能匹配
             self.try_match_skill(user_input)
 
-            # 5. 内层循环：支持多步工具调用（流式输出）
+            # 内层循环：支持多步工具调用
             while True:
                 try:
                     full_content, tool_calls, has_tool_call = await self.process_streaming_response(tools)
                 except KeyboardInterrupt:
                     break
 
-                # ── 构造 raw_message 存入消息历史 ──
                 if has_tool_call:
                     raw_message = self.backend.make_tool_call_raw_message(tool_calls, full_content)
                 else:
@@ -656,22 +469,41 @@ class AgentCore:
 
                 if tool_calls:
                     for tc in tool_calls:
-                        print(f"🔧 调用工具：{tc['name']}({tc['arguments']})...")
-                        tool_t0 = _time.perf_counter()
+                        tool_name = tc["name"]
+                        tool_args = tc["arguments"]
+                        
+                        # 检查缓存
+                        tool_cache = get_tool_cache()
+                        cached_result = tool_cache.get(tool_name, tool_args)
+                        
+                        if cached_result is not None:
+                            tool_text = cached_result
+                            tool_duration = 0  # 缓存命中，不计耗时
+                            print(f"📦 [{tool_name}] 缓存命中")
+                        else:
+                            print(f"🔧 调用工具：{tool_name}({tool_args})...")
+                            tool_t0 = _time.perf_counter()
+                            
+                            # 带重试的工具调用
+                            try:
+                                tool_resp = await mcp_manager.call_tool_with_retry(tool_name, tool_args)
+                            except RetryError as e:
+                                print(f"⚠️ 工具调用重试耗尽：{e}")
+                                tool_text = f"工具调用失败：{e}"
+                                tool_duration = int((_time.perf_counter() - tool_t0) * 1000)
+                            else:
+                                tool_duration = int((_time.perf_counter() - tool_t0) * 1000)
+                                tool_text = ""
+                                for item in tool_resp.content:
+                                    tool_text += item.text if hasattr(item, "text") else str(item)
+                                
+                                # 缓存结果
+                                tool_cache.set(tool_name, tool_args, tool_text)
 
-                        tool_resp = await session.call_tool(tc["name"], tc["arguments"])
-
-                        tool_duration = int((_time.perf_counter() - tool_t0) * 1000)
-
-                        tool_text = ""
-                        for item in tool_resp.content:
-                            tool_text += item.text if hasattr(item, "text") else str(item)
-
-                        # ── 记录工具调用 ──
                         if self.conv_enabled:
                             self.conv_store.save_tool_call(
-                                tool_name=tc["name"],
-                                arguments=tc["arguments"],
+                                tool_name=tool_name,
+                                arguments=tool_args,
                                 result=tool_text,
                                 duration_ms=tool_duration,
                             )
@@ -680,37 +512,93 @@ class AgentCore:
                             self.backend.make_tool_result_message(tc, tool_text)
                         )
                 else:
-                    # ── 记录助手回复 ──
                     if self.conv_enabled:
                         self.conv_store.save_message("assistant", full_content)
                     break
 
-            # ── 对话后：进化观察（异步，不阻塞下一轮）──
-            if self.evolution and self.evolution.enabled and full_content:
+            # 对话后：进化观察（异步，不阻塞）
+            if self.evo_handler.enabled and full_content:
                 threading.Thread(
-                    target=self._background_observe,
-                    args=(user_input, full_content),
+                    target=self.evo_handler.background_observe,
+                    args=(user_input, full_content, self.backend),
                     daemon=True,
                 ).start()
 
-    async def run(self, backend_name: str) -> None:
-        """运行 Agent 主流程"""
-        _t0 = _time.perf_counter()
+    def _dispatch_subsystem_command(self, user_input: str) -> bool | str | None:
+        """
+        分发 /memory 和 /history 子系统命令。
+
+        Returns:
+            None: 未匹配（非命令输入）
+            True: 命令已处理
+            str: session_id（恢复会话）
+        """
+        cmd = user_input.strip()
+
+        # /memory 子命令
+        if cmd.startswith("/memory") and self._memory_cmd_handler:
+            return self._memory_cmd_handler.handle(user_input)
+
+        # /history 子命令
+        if cmd.startswith("/history") and self._history_cmd_handler:
+            result = self._history_cmd_handler.handle(user_input)
+            if result is False:
+                return None
+            return result
+
+        return None
+
+    def _restore_session(self, session_id: str) -> None:
+        """恢复历史会话"""
+        restored = self.conv_store.restore_session_messages(session_id)
+        if restored:
+            self.messages.extend(restored)
+            self.turn_count = sum(1 for m in restored if m["role"] == "user")
+            self.conv_store.switch_to_session(session_id)
+            print(f"\n🔄 已恢复会话 [{session_id}]，共 {self.turn_count} 轮对话，可继续聊天")
+        else:
+            print(f"⚠️ 会话 [{session_id}] 无可恢复的消息")
+
+    # ── 主入口 ──
+
+    def _get_server_params(self) -> StdioServerParameters:
+        """获取 MCP Server 连接参数"""
+        venv_python = Path(__file__).parent.parent / ".venv" / "bin" / "python"
+        if venv_python.exists():
+            server_cmd = str(venv_python)
+            server_args = ["server.py"]
+        else:
+            server_cmd = "uv"
+            server_args = ["run", "server.py"]
+        return StdioServerParameters(
+            command=server_cmd,
+            args=server_args,
+            env={"PATH": os.environ["PATH"]},
+        )
+
+    async def run(self, backend_name: str) -> str | None:
+        """运行 Agent 主流程
+
+        Returns:
+            str: 如果需要切换模型，返回新的 backend_name
+            None: 正常退出
+        """
+        t0 = _time.perf_counter()
         label = self.backend.__class__.__name__.replace("Backend", "")
         print(f"\n🚀 正在启动 MCP Agent（{label}）...")
 
-        _t1 = _time.perf_counter()
-        print(f"   ⏱ 模型后端初始化：{_t1 - _t0:.2f}s")
+        t1 = _time.perf_counter()
+        print(f"   ⏱ 模型后端初始化：{t1 - t0:.2f}s")
 
-        # ── 阶段 1：加载 Skill 摘要（~100 tokens）──
+        # 加载 Skill 摘要
         self.skill_loader.load_summaries()
 
-        # ── 初始化 Agent ──
+        # 初始化
         await self.initialize()
-        _t2 = _time.perf_counter()
-        print(f"   ⏱ 记忆/会话数据库连接：{_t2 - _t1:.2f}s")
+        t2 = _time.perf_counter()
+        print(f"   ⏱ 记忆/会话数据库连接：{t2 - t1:.2f}s")
 
-        # ── 打印进化引擎状态 ──
+        # 打印进化引擎状态
         if self.evolution and self.evolution.enabled:
             evo_stats = self.evolution.get_full_stats()
             print(
@@ -718,79 +606,99 @@ class AgentCore:
                 f"假设 {evo_stats['hypotheses']['pending']} 条待确认"
             )
 
-        # ── 自动恢复最近一次会话 ──
+        # 打印缓存状态
+        tool_cache = get_tool_cache()
+        if tool_cache.enabled:
+            print(f"📦 工具缓存：已启用（TTL {tool_cache._cache._ttl}s）")
+
+        # 恢复上次会话
         restored_messages = self.restore_or_create_session(backend_name)
 
-        # 1. 配置 MCP Server 启动参数
-        # 优先使用 .venv 中的 python，省去 uv run 的依赖解析开销（约 0.5-1s）
-        _venv_python = Path(__file__).parent.parent / ".venv" / "bin" / "python"
-        if _venv_python.exists():
-            server_cmd = str(_venv_python)
-            server_args = ["server.py"]
-        else:
-            server_cmd = "uv"
-            server_args = ["run", "server.py"]
+        # 配置 MCP Server
+        server_params = self._get_server_params()
 
-        server_params = StdioServerParameters(
-            command=server_cmd,
-            args=server_args,
-            env={"PATH": os.environ["PATH"]},
-        )
+        # 初始化 MCP 会话管理器（带重试）
+        self._mcp_manager = MCPSessionManager()
+        self._exit_stack = AsyncExitStack()
 
         try:
-            async with AsyncExitStack() as stack:
-                # 2. 连接 MCP Server
-                _t3 = _time.perf_counter()
-                read_stream, write_stream = await stack.enter_async_context(
-                    stdio_client(server_params)
-                )
-                session = await stack.enter_async_context(
-                    ClientSession(read_stream, write_stream)
-                )
-                await session.initialize()
+            t3 = _time.perf_counter()
 
-                # 3. 获取工具列表
-                tools_resp = await session.list_tools()
-                _t4 = _time.perf_counter()
-                print(f"   ⏱ MCP Server 连接 + 工具加载：{_t4 - _t3:.2f}s")
-                print(f"✅ 已加载 {len(tools_resp.tools)} 个工具：")
-                for tool in tools_resp.tools:
-                    desc_first_line = tool.description.split(chr(10))[0]
-                    print(f"   - {tool.name}：{desc_first_line}")
-                tools = self.backend.build_tools(tools_resp.tools)
+            # 带重试的连接（独立 exit_stack 管理重试过程中的临时资源）
+            async def _do_connect():
+                tmp_stack = AsyncExitStack()
+                try:
+                    read_stream, write_stream = await tmp_stack.enter_async_context(
+                        stdio_client(server_params)
+                    )
+                    session = ClientSession(read_stream, write_stream)
+                    # ClientSession 必须作为上下文管理器使用，才会启动
+                    # _receive_loop 后台任务来接收服务端响应
+                    await tmp_stack.enter_async_context(session)
+                    await session.initialize()
+                    # 成功：将资源转移到主 exit_stack
+                    # 注意：tmp_stack 的清理回调会随 aclose() 执行，
+                    # 但我们通过 pop_all 将回调转移到主栈
+                    return session, tmp_stack
+                except Exception:
+                    await tmp_stack.aclose()
+                    raise
 
-                # 3.5 打印技能包信息
-                self.print_skill_packages()
-                print(f"   ⏱ 总启动耗时：{_t4 - _t0:.2f}s")
+            print("   🔄 正在连接 MCP Server（带重试机制）...")
+            session, tmp_stack = await self._mcp_manager.connect_with_retry(_do_connect)
+            # 成功后将临时栈的资源合并到主栈
+            self._exit_stack = tmp_stack
 
-                # 3.6 构建基础系统提示词
-                self.setup_system_prompt(tools_resp)
+            tools_resp = await session.list_tools()
+            t4 = _time.perf_counter()
+            print(f"   ⏱ MCP Server 连接 + 工具加载：{t4 - t3:.2f}s")
+            print(f"✅ 已加载 {len(tools_resp.tools)} 个工具：")
+            for tool in tools_resp.tools:
+                desc_first_line = tool.description.split(chr(10))[0]
+                print(f"   - {tool.name}：{desc_first_line}")
+            tools = self.backend.build_tools(tools_resp.tools)
 
-                # 3.8 恢复上次会话上下文
-                if restored_messages:
-                    self.messages.extend(restored_messages)
-                self.print_restored_history(restored_messages)
+            self.print_skill_packages()
+            print(f"   ⏱ 总启动耗时：{t4 - t0:.2f}s")
 
-                # 4. 对话主循环
-                await self.run_conversation_loop(session, tools, backend_name)
+            self.setup_system_prompt(tools_resp)
 
-            # ── 退出前保存对话记忆（静默模式，网络错误不打断退出）──
-            self.save_memory(silent=True)
+            if restored_messages:
+                self.messages.extend(restored_messages)
+            self.print_restored_history(restored_messages)
 
-            # ── 退出前关闭进化引擎 ──
+            # 运行对话循环，返回值可能是新的 backend_name
+            result = await self.run_conversation_loop(session, tools, backend_name)
+
+            # 退出前保存
+            self.memory_injector.save(self.messages, self.turn_count, self.backend, silent=True)
+
             if self.evolution:
                 self.evolution.close()
 
-            # ── 退出前关闭会话记录 ──
             if self.conv_enabled and self.conv_store.session_id:
                 self.conv_store.close_session()
                 print(f"💾 会话 [{self.conv_store.session_id}] 已保存")
 
+            # 打印缓存统计
+            cache_stats = tool_cache.stats
+            if cache_stats.total_requests > 0:
+                print(f"📊 缓存统计：命中 {cache_stats.hits}，未命中 {cache_stats.misses}，命中率 {cache_stats.hit_rate:.1%}")
+
+            print("\n👋 再见！")
+
+            # 返回结果（可能是新的 backend_name）
+            return result
+
         except KeyboardInterrupt:
             pass
+        except Exception as e:
+            print(f"\n❌ 连接失败：{e}")
+            print("   提示：请确保 server.py 可以正常运行")
         finally:
-            print("\n👋 再见！")
-            # 使用 os._exit 跳过 ONNX Runtime 的 atexit 清理
-            # （ChromaDB 默认嵌入模型退出时会缓慢解压/清理 onnx.tar.gz）
-            import os as _os
-            _os._exit(0)
+            try:
+                await self._exit_stack.aclose()
+            except Exception:
+                pass
+
+        return None

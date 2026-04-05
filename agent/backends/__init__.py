@@ -3,6 +3,7 @@
 """
 
 from .base import BaseBackend
+from .openai_compat import OpenAICompatibleBackend
 from .qwen import QwenBackend
 from .glm import GLMBackend
 from .ollama import OllamaBackend
@@ -38,6 +39,7 @@ def list_backends() -> list[str]:
 
 __all__ = [
     "BaseBackend",
+    "OpenAICompatibleBackend",
     "QwenBackend",
     "GLMBackend",
     "OllamaBackend",
