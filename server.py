@@ -1,9 +1,11 @@
 from fastmcp import FastMCP
 import sqlite3
 import os
+from contextlib import contextmanager
+from typing import Generator
 
 # 数据库路径使用绝对路径，避免因工作目录不同导致找不到文件
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sales.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "object_db", "sales.db")
 
 # 1. 初始化 MCP 服务
 mcp = FastMCP("Sales Data Server")
@@ -18,6 +20,38 @@ def _get_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+@contextmanager
+def _get_db_cursor() -> Generator[sqlite3.Cursor, None, None]:
+    """
+    数据库连接上下文管理器，确保连接正确关闭。
+    自动提交成功事务，失败时回滚。
+    """
+    conn = None
+    try:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        yield cursor
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise RuntimeError(f"数据库操作失败: {e}") from e
+    finally:
+        if conn:
+            conn.close()
+
+
+def _escape_like_pattern(pattern: str) -> str:
+    """
+    转义 SQL LIKE 查询中的特殊字符，防止注入。
+    
+    LIKE 查询中的特殊字符：
+    - %: 匹配任意字符
+    - _: 匹配单个字符
+    """
+    return pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _rows_to_dicts(rows):
@@ -39,11 +73,9 @@ def list_products() -> str:
         str: 产品列表文本
     """
     try:
-        conn = _get_connection()
-        c = conn.cursor()
-        c.execute("SELECT DISTINCT product_name FROM sales_records ORDER BY product_name")
-        products = [row[0] for row in c.fetchall()]
-        conn.close()
+        with _get_db_cursor() as c:
+            c.execute("SELECT DISTINCT product_name FROM sales_records ORDER BY product_name")
+            products = [row[0] for row in c.fetchall()]
 
         if products:
             report = "📦 **产品列表**\n"
@@ -55,7 +87,7 @@ def list_products() -> str:
             return "暂无产品数据"
 
     except Exception as e:
-        return f"查询出错：{str(e)}"
+        return f"⚠️ 查询出错：{str(e)}"
 
 
 # ─────────────────────────────────────────────
@@ -74,26 +106,30 @@ def query_sales_by_product(product_name: str) -> str:
     返回：
         str: 包含各地区销售金额总和及记录条数的文本报告
     """
+    if not product_name or not product_name.strip():
+        return "⚠️ 产品名称不能为空"
+    
+    # 输入验证：限制长度防止滥用
+    product_name = product_name.strip()[:100]
+    
     try:
-        conn = _get_connection()
-        c = conn.cursor()
-
-        # 先尝试精确匹配
-        c.execute("SELECT region, amount, sale_date FROM sales_records WHERE product_name=?",
-                  (product_name,))
-        rows = c.fetchall()
-
-        # 精确匹配无结果时，去掉空格做模糊匹配
-        if not rows:
-            no_space = product_name.replace(" ", "")
+        with _get_db_cursor() as c:
+            # 先尝试精确匹配
             c.execute(
-                "SELECT region, amount, sale_date FROM sales_records "
-                "WHERE REPLACE(product_name, ' ', '')=?",
-                (no_space,),
+                "SELECT region, amount, sale_date FROM sales_records WHERE product_name=?",
+                (product_name,)
             )
             rows = c.fetchall()
 
-        conn.close()
+            # 精确匹配无结果时，去掉空格做模糊匹配
+            if not rows:
+                no_space = product_name.replace(" ", "")
+                c.execute(
+                    "SELECT region, amount, sale_date FROM sales_records "
+                    "WHERE REPLACE(product_name, ' ', '')=?",
+                    (no_space,)
+                )
+                rows = c.fetchall()
 
         if rows:
             total_amount = sum(row[1] for row in rows)
@@ -108,7 +144,7 @@ def query_sales_by_product(product_name: str) -> str:
             return f"未找到产品 '{product_name}' 的销售记录"
 
     except Exception as e:
-        return f"查询出错：{str(e)}"
+        return f"⚠️ 查询出错：{str(e)}"
 
 
 # ─────────────────────────────────────────────
@@ -127,26 +163,30 @@ def query_sales_by_region(region: str) -> str:
     返回：
         str: 包含该区域各产品销售情况的文本报告
     """
+    if not region or not region.strip():
+        return "⚠️ 区域名称不能为空"
+    
+    # 输入验证：限制长度防止滥用
+    region = region.strip()[:50]
+    
     try:
-        conn = _get_connection()
-        c = conn.cursor()
-
-        c.execute(
-            "SELECT product_name, amount, sale_date FROM sales_records WHERE region=?",
-            (region,),
-        )
-        rows = c.fetchall()
-
-        # 模糊匹配
-        if not rows and region:
+        with _get_db_cursor() as c:
+            # 先尝试精确匹配
             c.execute(
-                "SELECT product_name, amount, sale_date FROM sales_records "
-                "WHERE region LIKE ?",
-                (f"%{region}%",),
+                "SELECT product_name, amount, sale_date FROM sales_records WHERE region=?",
+                (region,)
             )
             rows = c.fetchall()
 
-        conn.close()
+            # 精确匹配无结果时，使用安全的模糊匹配
+            if not rows:
+                safe_region = _escape_like_pattern(region)
+                c.execute(
+                    "SELECT product_name, amount, sale_date FROM sales_records "
+                    "WHERE region LIKE ? ESCAPE '\\'",
+                    (f"%{safe_region}%",)
+                )
+                rows = c.fetchall()
 
         if rows:
             total_amount = sum(row[1] for row in rows)
@@ -161,7 +201,7 @@ def query_sales_by_region(region: str) -> str:
             return f"未找到区域 '{region}' 的销售记录"
 
     except Exception as e:
-        return f"查询出错：{str(e)}"
+        return f"⚠️ 查询出错：{str(e)}"
 
 
 # ─────────────────────────────────────────────
@@ -178,30 +218,26 @@ def get_sales_overview() -> str:
         str: 全局销售概览报告
     """
     try:
-        conn = _get_connection()
-        c = conn.cursor()
+        with _get_db_cursor() as c:
+            # 总额和笔数
+            c.execute("SELECT COUNT(*), SUM(amount) FROM sales_records")
+            total_orders, total_amount = c.fetchone()
+            total_amount = total_amount or 0
+            avg_price = total_amount / total_orders if total_orders > 0 else 0
 
-        # 总额和笔数
-        c.execute("SELECT COUNT(*), SUM(amount) FROM sales_records")
-        total_orders, total_amount = c.fetchone()
-        total_amount = total_amount or 0
-        avg_price = total_amount / total_orders if total_orders > 0 else 0
+            # 各区域汇总
+            c.execute(
+                "SELECT region, COUNT(*) as cnt, SUM(amount) as total "
+                "FROM sales_records GROUP BY region ORDER BY total DESC"
+            )
+            region_rows = c.fetchall()
 
-        # 各区域汇总
-        c.execute(
-            "SELECT region, COUNT(*) as cnt, SUM(amount) as total "
-            "FROM sales_records GROUP BY region ORDER BY total DESC"
-        )
-        region_rows = c.fetchall()
-
-        # 各产品汇总
-        c.execute(
-            "SELECT product_name, COUNT(*) as cnt, SUM(amount) as total "
-            "FROM sales_records GROUP BY product_name ORDER BY total DESC"
-        )
-        product_rows = c.fetchall()
-
-        conn.close()
+            # 各产品汇总
+            c.execute(
+                "SELECT product_name, COUNT(*) as cnt, SUM(amount) as total "
+                "FROM sales_records GROUP BY product_name ORDER BY total DESC"
+            )
+            product_rows = c.fetchall()
 
         report = "📊 **销售全局概览**\n\n"
         report += f"**核心指标**\n"
@@ -222,7 +258,7 @@ def get_sales_overview() -> str:
         return report
 
     except Exception as e:
-        return f"查询出错：{str(e)}"
+        return f"⚠️ 查询出错：{str(e)}"
 
 
 # ─────────────────────────────────────────────
@@ -245,30 +281,33 @@ def get_raw_sales_data(product_name: str | None = None, region: str | None = Non
     try:
         import json
 
-        conn = _get_connection()
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-
-        sql = "SELECT product_name, region, amount, sale_date FROM sales_records WHERE 1=1"
-        params = []
-
+        # 输入验证
         if product_name:
-            sql += " AND product_name=?"
-            params.append(product_name)
-
+            product_name = product_name.strip()[:100]
         if region:
-            sql += " AND region=?"
-            params.append(region)
+            region = region.strip()[:50]
 
-        sql += " ORDER BY sale_date"
-        c.execute(sql, params)
-        rows = _rows_to_dicts(c.fetchall())
-        conn.close()
+        with _get_db_cursor() as c:
+            sql = "SELECT product_name, region, amount, sale_date FROM sales_records WHERE 1=1"
+            params = []
+
+            if product_name:
+                sql += " AND product_name=?"
+                params.append(product_name)
+
+            if region:
+                sql += " AND region=?"
+                params.append(region)
+
+            sql += " ORDER BY sale_date"
+            c.execute(sql, params)
+            rows = _rows_to_dicts(c.fetchall())
 
         return json.dumps(rows, ensure_ascii=False)
 
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        import json
+        return json.dumps({"error": f"查询失败: {str(e)}"})
 
 
 # ─────────────────────────────────────────────
