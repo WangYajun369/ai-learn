@@ -1,7 +1,7 @@
 import sqlite3
 import os
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sales.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "object_db", "sales.db")
 conn = sqlite3.connect(DB_PATH)
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS sales_records
