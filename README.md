@@ -26,6 +26,8 @@ server.py（MCP Server — 5 个销售数据工具）     memory_db/（长期记
 sales.db（SQLite — 52 条 Q2 销售记录）        user_profile.db（用户画像 + 假设）
 ```
 
+![architecture.drawio](docs/architecture.drawio.png)
+
 ### 工具调用缓存
 
 基于 TTL + LRU 的高效缓存机制：
