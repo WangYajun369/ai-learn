@@ -6,8 +6,7 @@ MCP + Skills 销售分析 Agent。演示如何通过 MCP 工具 + Skills 技能�
 构建具备"专家级分析能力"的 AI 助手。
 
 用法：
-    uv run agent.py          # 启动 Agent（交互式选择模型，默认 REPL 模式）
-    uv run agent.py --tui    # 启动 Agent（TUI 界面）
+    uv run agent.py          # 启动 Agent（交互式选择模型）
 """
 
 import asyncio
@@ -72,12 +71,7 @@ def select_backend() -> str | None:
 
 def main():
     """主入口函数"""
-    # 检查是否有 --tui 参数
-    if "--tui" in sys.argv:
-        # TUI 模式（如果需要可以在这里实现）
-        print("TUI 模式暂未实现，使用 REPL 模式")
-
-    # 选择后端
+    # REPL 模式：选择后端
     backend_name = select_backend()
     if backend_name is None:
         print("\n👋 再见！")

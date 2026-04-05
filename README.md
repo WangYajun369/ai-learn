@@ -6,22 +6,23 @@
 
 - **🔧 MCP 工具调用**：基于 FastMCP 实现标准化工具协议，支持多步工具链调用
 - **📦 渐进式 Skill 加载**：三阶段按需加载（摘要→完整指令→脚本/模板），最小化 Token 消耗
-- **🧠 双层记忆系统**：
+- **🧠 三层记忆系统**：
   - **向量记忆**（ChromaDB）：跨会话语义检索，自动摘要存储
   - **会话记录**（SQLite）：完整对话回溯，工具调用链追踪（含耗时）
+  - **进化式记忆**（用户画像 + 假设队列）：Agent 自我进化，学习用户偏好和约束
 - **🤖 多模型支持**：通义千问、智谱 GLM、Ollama 本地模型，统一后端抽象接口
-- **💻 双模式界面**：REPL 终端模式 + Textual TUI 图形界面
+- **💻 交互式界面**：REPL 终端模式，支持流式输出和命令补全
 
 ## 🏗️ 架构
 
 ```
 用户终端（自然语言）
     ↓
-agent.py（MCP Client + Skill Engine + LLM Backend + 向量记忆 + 会话记录）
+agent.py（MCP Client + Skill Engine + LLM Backend + 三层记忆系统）
     ↓ stdio                                    ↕ ChromaDB          ↕ SQLite
 server.py（MCP Server — 5 个销售数据工具）     memory_db/（长期记忆） conversations.db（会话记录）
-    ↓
-sales.db（SQLite — 52 条 Q2 销售记录）
+    ↓                                                       ↕
+sales.db（SQLite — 52 条 Q2 销售记录）                user_profile.db（用户画像 + 假设）
 ```
 
 ### 长期记忆（向量数据库）
@@ -40,6 +41,17 @@ sales.db（SQLite — 52 条 Q2 销售记录）
 | `/memory delete <记忆ID>` | 删除指定记忆 |
 | `/memory clear` | 清空所有记忆 |
 | `/memory stats` | 查看记忆统计信息 |
+
+### 进化式记忆（用户画像）
+
+Agent 自我进化能力，存储于 `./object_db/user_profile.db`：
+- **UserProfileStore**：持久化用户画像（偏好/约束/工作流）
+- **HypothesisStore**：管理待确认的假设约束队列
+- **Observer**：观察每轮对话，提取用户行为信号
+- **EvolutionEngine**：协调观察→总结→进化的完整流程
+- **自动进化**：每轮对话后自动观察用户行为，提取偏好和约束
+- **假设管理**：识别遗漏约束，生成待确认假设，用户确认后转为正式约束
+- **/evolve 命令**：综合分析整个会话，批量更新用户画像
 
 ### 会话记录（SQLite）
 
@@ -98,9 +110,6 @@ uv run init_db.py
 # 启动 Agent（默认 REPL 模式，交互式选择模型）
 uv run agent.py
 
-# 或使用 TUI 界面
-uv run agent.py --tui
-
 # 单独运行 MCP Server（测试用）
 uv run server.py
 ```
@@ -150,6 +159,29 @@ uv run server.py
     返回：[{"product": "AI 助手基础版", "month": "4月", "sales": 45000}, ...]
   → query_sales_by_region({"region": "华南"})  ⏱ 32ms
     返回：[{"product": "AI 助手基础版", "month": "4月", "sales": 38000}, ...]
+══════════════════════════════════════════════════════
+```
+
+```
+👤 你：/evolve
+🧬 正在深度分析对话历史，归纳用户画像...
+
+🧬 分析完成！
+   📌 总结：用户关注销售数据分析，偏好华东和华南区域对比
+   🏷️ 新增偏好：2 条
+   📐 新增约束：1 条
+   🔄 新增工作流：0 条
+
+🧬 当前用户画像：
+══════════════════════════════════════════════════════
+【偏好】2 条
+   ✓ 关注华东区和华南区销售表现
+   ✓ 重视数据可视化输出
+
+【约束】1 条
+   ✓ 需要对比分析不同区域
+
+【工作流】0 条
 ══════════════════════════════════════════════════════
 ```
 
@@ -214,9 +246,14 @@ OLLAMA_MODEL=qwen2.5:7b
 │   │   ├── qwen.py         # 通义千问后端
 │   │   ├── glm.py          # 智谱 GLM 后端
 │   │   └── ollama.py       # Ollama 本地模型后端
-│   └── commands/           # 斜杠命令处理器
-│       ├── memory.py       # /memory 命令
-│       └── history.py      # /history 命令
+│   ├── commands/           # 斜杠命令处理器
+│   │   ├── memory.py       # /memory 命令
+│   │   └── history.py      # /history 命令
+│   └── evolution/          # 进化式记忆模块
+│       ├── engine.py       # 进化引擎：协调观察→总结→进化
+│       ├── observer.py     # 观察者：提取用户行为信号
+│       ├── profile.py      # UserProfileStore：用户画像持久化
+│       └── hypothesis.py   # HypothesisStore：待确认假设管理
 ├── server.py               # MCP Server（FastMCP，5 个销售工具）
 ├── memory_store.py         # ChromaDB 向量记忆封装
 ├── conversation_store.py   # SQLite 会话记录封装
@@ -228,19 +265,51 @@ OLLAMA_MODEL=qwen2.5:7b
 ├── object_db/              # 数据库统一存储目录（运行后自动创建）
 │   ├── sales.db            # 销售业务数据
 │   ├── memory_db/          # ChromaDB 向量记忆持久化
-│   └── conversations.db    # 会话记录与工具调用链
+│   ├── conversations.db    # 会话记录与工具调用链
+│   └── user_profile.db     # 用户画像与假设约束
 ├── pyproject.toml          # 项目依赖配置
 └── README.md               # 本文件
 ```
 
 ## 📝 斜杠命令
 
+### 记忆管理
+
+| 命令 | 说明 |
+|------|------|
+| `/memory list` | 列出最近 10 条记忆 |
+| `/memory search <关键词>` | 语义搜索相关记忆 |
+| `/memory delete <记忆ID>` | 删除指定记忆 |
+| `/memory clear` | 清空所有记忆 |
+| `/memory stats` | 查看记忆统计信息 |
+
+### 会话管理
+
 | 命令 | 说明 |
 |------|------|
 | `/new` | 创建新会话 |
-| `/memory list/search/delete/clear/stats` | 记忆管理 |
-| `/history [show/resume/delete/clear/stats]` | 会话记录管理 |
-| `/help` | 显示所有命令 |
+| `/history` | 列出最近的会话记录 |
+| `/history show` | 选择并查看会话详情（上下键选择） |
+| `/history resume` | 恢复历史会话并继续对话（上下键选择） |
+| `/history delete` | 删除指定会话（上下键选择） |
+| `/history clear` | 清空所有历史会话 |
+| `/history stats` | 查看会话统计 |
+
+### 用户画像进化
+
+| 命令 | 说明 |
+|------|------|
+| `/evolve` | 主动总结归纳（深度分析用户画像） |
+| `/profile` | 查看当前用户画像 |
+| `/profile clear` | 清空用户画像 |
+| `/hypothesis` | 查看待确认假设 |
+| `/hypothesis clear` | 清空所有假设 |
+
+### 其他
+
+| 命令 | 说明 |
+|------|------|
+| `/help` | 显示所有命令帮助 |
 | `/exit` | 退出程序 |
 
 ## 🔑 关键设计模式
@@ -259,6 +328,15 @@ OLLAMA_MODEL=qwen2.5:7b
 
 ### Skill-Tool 协同
 SKILL.md 定义业务流程和工具调用顺序，scripts/ 负责计算逻辑，references/ 提供输出模板。
+
+### 进化式记忆系统
+- **UserProfileStore**：持久化用户画像（preferences/constraints/workflows）
+- **HypothesisStore**：管理待确认假设队列，用户确认后转为约束
+- **Observer**：每轮对话后观察用户行为，提取行为信号
+- **EvolutionEngine**：协调观察→总结→进化的完整流程
+- **画像注入**：每轮对话前自动将用户画像注入 system prompt
+- **假设提示**：根据用户输入触发相关假设提示，用户可确认/拒绝
+- **深度分析**：`/evolve` 命令综合分析整个会话，批量更新画像
 
 ## 📄 License
 
