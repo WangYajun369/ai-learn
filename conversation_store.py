@@ -141,7 +141,7 @@ class ConversationStore:
         不包含 system 消息（由 agent.py 的 base_system_prompt 负责）。
         """
         msgs = self._conn.execute(
-            "SELECT role, content FROM messages WHERE session_id=? ORDER BY turn_order",
+            "SELECT role, content, created_at FROM messages WHERE session_id=? ORDER BY turn_order",
             (session_id,),
         ).fetchall()
 
@@ -151,7 +151,7 @@ class ConversationStore:
             if not content or not content.strip():
                 continue
             if m["role"] in ("user", "assistant"):
-                result.append({"role": m["role"], "content": content})
+                result.append({"role": m["role"], "content": content, "created_at": m["created_at"]})
 
         return result
 

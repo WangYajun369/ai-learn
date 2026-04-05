@@ -24,11 +24,17 @@ from .skill_loader import SkillLoader
 from .backends.base import BaseBackend
 from .commands.memory import MemoryCommandHandler
 from .commands.history import HistoryCommandHandler
+from .evolution.engine import EvolutionEngine
 
 
 # 斜杠命令定义
 SLASH_COMMANDS = [
     ("/new", "创建新会话"),
+    ("/evolve", "🧬 主动总结归纳（深度分析用户画像）"),
+    ("/profile", "🧬 查看当前用户画像"),
+    ("/profile clear", "清空用户画像"),
+    ("/hypothesis", "💡 查看待确认假设"),
+    ("/hypothesis clear", "清空所有假设"),
     ("/memory list", "列出最近 10 条记忆"),
     ("/memory search", "语义搜索记忆（需跟关键词）"),
     ("/memory delete", "删除指定会话的记忆"),
@@ -92,6 +98,9 @@ class AgentCore:
         self.memory_handler: MemoryCommandHandler | None = None
         self.history_handler: HistoryCommandHandler | None = None
 
+        # 进化引擎
+        self.evolution: EvolutionEngine | None = None
+
     async def initialize(self) -> bool:
         """初始化 Agent，连接数据库和加载配置"""
         # 连接记忆数据库
@@ -100,6 +109,10 @@ class AgentCore:
 
         # 连接会话记录数据库
         self.conv_enabled = self.conv_store.connect()
+
+        # 连接进化引擎（用户画像 + 假设队列）
+        self.evolution = EvolutionEngine()
+        self.evolution.connect(silent=True)
 
         # 初始化命令处理器
         self.memory_handler = MemoryCommandHandler(self.memory_store, self.memory_enabled)
@@ -194,10 +207,12 @@ class AgentCore:
         for i, msg in enumerate(restored_messages):
             role = msg["role"]
             content = msg["content"]
+            ts = msg.get("created_at", "")
+            ts_str = f"  🕐 {ts}" if ts else ""
             if role == "user":
-                print(f"\n👤 用户：{content}", flush=True)
+                print(f"\n👤 用户：{content}{ts_str}", flush=True)
             elif role == "assistant":
-                print(f"\n🤖 Agent：{content}", flush=True)
+                print(f"\n🤖 Agent：{content}{ts_str}", flush=True)
             # 每轮对话（用户+助手）后加分隔线
             if role == "assistant":
                 print("\n" + "-" * 47, flush=True)
@@ -206,25 +221,36 @@ class AgentCore:
 
     def inject_memory(self, user_input: str) -> None:
         """根据用户输入检索相关记忆，注入到 system prompt"""
+        # ── 注入向量记忆 ──
         if not self.memory_enabled or not self.memory_store._collection:
-            return
-        count = self.memory_store._collection.count()
-        if count == 0:
-            return
-        related = self.memory_store.search(user_input, n_results=3)
-        if related:
-            memory_lines = ["以下是相关的历史记忆（供参考）："]
-            for i, m in enumerate(related, 1):
-                ts = m["metadata"].get("timestamp", "")
-                memory_lines.append(f"  {i}. [{ts}] {m['content']}")
-            memory_text = "\n".join(memory_lines)
-            # 在 system prompt 末尾追加记忆
-            current_system = self.messages[0]["content"]
-            self.messages[0] = {
-                "role": "system",
-                "content": current_system + "\n\n" + memory_text,
-            }
-            print("   🧠 已检索到相关历史记忆")
+            pass
+        else:
+            count = self.memory_store._collection.count()
+            if count > 0:
+                related = self.memory_store.search(user_input, n_results=3)
+                if related:
+                    memory_lines = ["以下是相关的历史记忆（供参考）："]
+                    for i, m in enumerate(related, 1):
+                        ts = m["metadata"].get("timestamp", "")
+                        memory_lines.append(f"  {i}. [{ts}] {m['content']}")
+                    memory_text = "\n".join(memory_lines)
+                    current_system = self.messages[0]["content"]
+                    self.messages[0] = {
+                        "role": "system",
+                        "content": current_system + "\n\n" + memory_text,
+                    }
+                    print("   🧠 已检索到相关历史记忆")
+
+        # ── 注入用户画像 ──
+        if self.evolution and self.evolution.enabled:
+            profile_text = self.evolution.get_profile_for_prompt()
+            if profile_text:
+                current_system = self.messages[0]["content"]
+                self.messages[0] = {
+                    "role": "system",
+                    "content": current_system + "\n\n" + profile_text,
+                }
+                print("   🧬 已注入用户画像")
 
     def save_memory(self, silent: bool = False) -> None:
         """调用 LLM 生成对话摘要并存入向量数据库"""
@@ -267,6 +293,87 @@ class AgentCore:
                     topics.add(keyword)
         return sorted(topics)
 
+    # ── 进化引擎相关方法 ──
+
+    def _background_observe(self, user_input: str, assistant_reply: str) -> None:
+        """后台执行进化观察（不阻塞主对话循环）"""
+        try:
+            self.evolution.observe_and_evolve(
+                user_input=user_input,
+                assistant_reply=assistant_reply,
+                backend=self.backend,
+                silent=True,
+            )
+        except Exception as e:
+            print(f"\n   ⚠️ 进化观察异常：{e}")
+
+    async def _handle_evolve(self) -> None:
+        """处理 /evolve 命令：综合分析会话，更新用户画像"""
+        if not self.evolution or not self.evolution.enabled:
+            print("⚠️ 进化引擎不可用")
+            return
+        if self.turn_count < 2:
+            print("💡 对话轮次太少（至少需要 2 轮），暂无法进行深度分析")
+            return
+
+        print("\n🧬 正在深度分析对话历史，归纳用户画像...", flush=True)
+        result = self.evolution.deep_evolve(self.messages, self.backend)
+
+        if "error" in result:
+            print(f"⚠️ 分析失败：{result['error']}")
+            return
+
+        stats = result.get("stats", {})
+        print(f"\n🧬 分析完成！")
+        print(f"   📌 总结：{result.get('summary', '无')}")
+        print(f"   🏷️ 新增偏好：{stats.get('preferences', 0)} 条")
+        print(f"   📐 新增约束：{stats.get('constraints', 0)} 条")
+        print(f"   🔄 新增工作流：{stats.get('workflows', 0)} 条")
+
+        # 显示完整画像
+        print(self.evolution.profile_store.format_for_display())
+
+    def _handle_show_profile(self) -> None:
+        """处理 /profile 命令：显示用户画像"""
+        if not self.evolution or not self.evolution.enabled:
+            print("⚠️ 进化引擎不可用")
+            return
+        print("\n🧬 当前用户画像：")
+        print("═" * 60)
+        print(self.evolution.profile_store.format_for_display())
+        print("═" * 60)
+
+    def _handle_clear_profile(self) -> None:
+        """处理 /profile clear 命令：清空用户画像"""
+        if not self.evolution or not self.evolution.enabled:
+            print("⚠️ 进化引擎不可用")
+            return
+        count = self.evolution.profile_store.clear_all()
+        print(f"\n🧬 已清空 {count} 条画像数据")
+
+    def _handle_show_hypotheses(self) -> None:
+        """处理 /hypothesis 命令：显示待确认假设"""
+        if not self.evolution or not self.evolution.enabled:
+            print("⚠️ 进化引擎不可用")
+            return
+        print("\n💡 假设队列：")
+        print("═" * 60)
+        print(self.evolution.hypothesis_store.format_for_display())
+        print("═" * 60)
+        print("\n提示：对假设提示回复「是」确认，回复「否」拒绝")
+
+    def _handle_clear_hypotheses(self) -> None:
+        """处理 /hypothesis clear 命令：清空所有假设"""
+        if not self.evolution or not self.evolution.enabled:
+            print("⚠️ 进化引擎不可用")
+            return
+        pending = self.evolution.hypothesis_store.get_stats()["pending"]
+        # 软删除所有 pending 假设
+        all_pending = self.evolution.hypothesis_store.get_pending(limit=100)
+        for item in all_pending:
+            self.evolution.hypothesis_store.reject_hypothesis(item["id"])
+        print(f"\n💡 已清空 {len(all_pending)} 条待确认假设")
+
     def handle_new_session(self, backend_name: str) -> None:
         """处理 /new 命令创建新会话"""
         if self.conv_enabled:
@@ -274,6 +381,7 @@ class AgentCore:
             new_sid = self.conv_store.create_session(backend_name)
         else:
             new_sid = generate_memory_id()
+        # 重置为 base_system_prompt（不含画像/记忆注入，下次对话时重新注入）
         self.messages = [{"role": "system", "content": self.base_system_prompt}]
         self.active_skill = None
         self.turn_count = 0
@@ -455,6 +563,27 @@ class AgentCore:
                 self.handle_help()
                 continue
 
+            # ── 进化命令：/evolve ──
+            if user_input.strip().lower() in ("/evolve", "/evolve "):
+                await self._handle_evolve()
+                continue
+
+            # ── 进化命令：/profile ──
+            if user_input.strip().lower() == "/profile":
+                self._handle_show_profile()
+                continue
+            if user_input.strip().lower() == "/profile clear":
+                self._handle_clear_profile()
+                continue
+
+            # ── 进化命令：/hypothesis ──
+            if user_input.strip().lower() == "/hypothesis":
+                self._handle_show_hypotheses()
+                continue
+            if user_input.strip().lower() == "/hypothesis clear":
+                self._handle_clear_hypotheses()
+                continue
+
             # ── 记忆管理命令 ──
             if self.memory_handler and self.memory_handler.handle(user_input):
                 continue
@@ -482,7 +611,20 @@ class AgentCore:
 
             self.turn_count += 1
 
-            # ── 检索相关记忆并注入 ──
+            # ── 检查用户对假设的确认/拒绝 ──
+            if self.evolution and self.evolution.enabled:
+                confirm_result = self.evolution.handle_user_confirmation(user_input)
+                if confirm_result:
+                    print(f"\n🧬 {confirm_result}\n")
+                    # 确认/拒绝后，继续正常对话流程（不跳过）
+
+            # ── 检查待确认假设提示 ──
+            if self.evolution and self.evolution.enabled:
+                hint = self.evolution.get_hypothesis_hint(user_input)
+                if hint:
+                    print(f"\n{hint}\n")
+
+            # ── 检索相关记忆并注入（向量记忆 + 用户画像）──
             self.inject_memory(user_input)
 
             self.messages.append({"role": "user", "content": user_input})
@@ -543,6 +685,14 @@ class AgentCore:
                         self.conv_store.save_message("assistant", full_content)
                     break
 
+            # ── 对话后：进化观察（异步，不阻塞下一轮）──
+            if self.evolution and self.evolution.enabled and full_content:
+                threading.Thread(
+                    target=self._background_observe,
+                    args=(user_input, full_content),
+                    daemon=True,
+                ).start()
+
     async def run(self, backend_name: str) -> None:
         """运行 Agent 主流程"""
         _t0 = _time.perf_counter()
@@ -559,6 +709,14 @@ class AgentCore:
         await self.initialize()
         _t2 = _time.perf_counter()
         print(f"   ⏱ 记忆/会话数据库连接：{_t2 - _t1:.2f}s")
+
+        # ── 打印进化引擎状态 ──
+        if self.evolution and self.evolution.enabled:
+            evo_stats = self.evolution.get_full_stats()
+            print(
+                f"🧬 进化引擎：画像 {evo_stats['profile']['total_items']} 条，"
+                f"假设 {evo_stats['hypotheses']['pending']} 条待确认"
+            )
 
         # ── 自动恢复最近一次会话 ──
         restored_messages = self.restore_or_create_session(backend_name)
@@ -618,6 +776,10 @@ class AgentCore:
 
             # ── 退出前保存对话记忆（静默模式，网络错误不打断退出）──
             self.save_memory(silent=True)
+
+            # ── 退出前关闭进化引擎 ──
+            if self.evolution:
+                self.evolution.close()
 
             # ── 退出前关闭会话记录 ──
             if self.conv_enabled and self.conv_store.session_id:

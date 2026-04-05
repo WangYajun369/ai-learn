@@ -126,7 +126,9 @@ class HistoryCommandHandler:
                 # 截断过长的内容
                 if len(content) > 200:
                     content = content[:200] + "..."
-                print(f"\n  {role_label}：{content}")
+                ts = msg.get("created_at", "")
+                ts_str = f"  🕐 {ts}" if ts else ""
+                print(f"\n  {role_label}：{content}{ts_str}")
 
         if detail["tool_calls"]:
             print(f"\n🔧 工具调用链（{len(detail['tool_calls'])} 次）：")
