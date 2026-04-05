@@ -12,7 +12,7 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              用户终端层                                       │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  REPL 交互界面  │  TUI 图形界面  │  斜杠命令 (/help, /memory, ...)   │   │
+│  │  REPL 交互界面  │  斜杠命令 (/help, /memory, /evolve, ...)        │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       ↓
@@ -30,6 +30,11 @@
 │  │  agent/commands/             # 斜杠命令处理器                        │   │
 │  │    ├── memory.py             # /memory 命令                        │   │
 │  │    └── history.py            # /history 命令                       │   │
+│  │  agent/evolution/            # 进化式记忆模块                        │   │
+│  │    ├── engine.py             # 进化引擎：协调观察→总结→进化            │   │
+│  │    ├── observer.py           # 观察者：提取用户行为信号                │   │
+│  │    ├── profile.py            # UserProfileStore：用户画像持久化         │   │
+│  │    └── hypothesis.py        # HypothesisStore：待确认假设管理          │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       ↓ stdio (MCP 协议)
@@ -55,6 +60,14 @@
 │  │  销售业务数据     │  向量长期记忆     │  会话记录与工具调用链            │  │
 │  │  52 条测试记录   │  语义检索         │  完整对话回溯                   │  │
 │  └──────────────────┴──────────────────┴─────────────────────────────────┘  │
+│  ┌──────────────────┬─────────────────────────────────────────────────────┐  │
+│  │  object_db/      │                                             │  │
+│  │  user_profile.db │                                             │  │
+│  │  (SQLite)        │                                             │  │
+│  │                  │                                             │  │
+│  │  用户画像与假设   │                                             │  │
+│  │  进化式记忆       │                                             │  │
+│  └──────────────────┴─────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       ↓
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -77,7 +90,7 @@
 |------|------|
 | **渐进式加载** | 最小化 Token 消耗，三阶段按需加载 Skill |
 | **后端抽象** | 统一接口支持多模型（Qwen/GLM/Ollama） |
-| **双层记忆** | 向量记忆（语义检索）+ SQLite（完整记录） |
+| **三层记忆** | 向量记忆（语义检索）+ SQLite（完整记录）+ 进化式记忆（用户画像） |
 | **工具协同** | SKILL.md 定义流程，scripts/ 负责计算逻辑 |
 
 ---
@@ -144,7 +157,7 @@ self.conv_session_id: str          # 会话记录 ID
 - **GLMBackend**: 智谱 BigModel API（GLM-4.5-Air/GLM-4-Flash）
 - **OllamaBackend**: 本地模型服务（OpenAI 兼容接口）
 
-### 2.4 双层记忆系统
+### 2.4 三层记忆系统
 
 #### 2.4.1 向量记忆 (memory_store.py)
 
@@ -178,6 +191,67 @@ tool_calls:    id, session_id, message_id, tool_name, arguments, result, duratio
 - 工具调用链追踪：记录每次调用的名称、参数、结果、耗时（ms）
 - WAL 模式：支持高并发读写
 
+#### 2.4.3 进化式记忆 (agent/evolution/)
+
+Agent 自我进化能力，学习用户偏好和约束：
+
+**核心组件**：
+
+1. **UserProfileStore (profile.py)**
+   - 持久化用户画像（SQLite）
+   - 三类画像数据：preferences（偏好）、constraints（约束）、workflows（工作流）
+   - 支持去重合并（同类别+同内容）
+
+2. **HypothesisStore (hypothesis.py)**
+   - 管理待确认假设队列
+   - 生命周期：pending → confirmed（转为约束）/ rejected
+   - 最大提示次数限制（默认 3 次）
+
+3. **Observer (observer.py)**
+   - 每轮对话后 LLM 分析用户行为
+   - 提取信号：preferences、missing_constraints、workflow_patterns
+
+4. **EvolutionEngine (engine.py)**
+   - 协调观察→总结→进化的完整流程
+   - 对话前：注入画像 + 检查假设提示
+   - 对话后：后台线程执行进化观察
+   - 用户确认/拒绝：自动处理假设队列
+
+**表结构**：
+```sql
+-- 用户画像表
+user_profiles:
+  id, category, content, source, confidence, occurrence_count, created_at, updated_at
+
+-- 假设队列表
+hypotheses:
+  id, hypothesis, context, trigger_keywords, prompt_count, status, created_at, updated_at
+```
+
+**工作流程**：
+```
+每轮对话前:
+  注入用户画像到 system prompt
+  ↓
+  检查用户输入是否触发待确认假设
+  ↓
+  如果触发，显示提示："用户可能需要约束：XXX，回复「是」确认，「否」拒绝"
+
+每轮对话后:
+  后台线程调用 LLM 分析对话
+  ↓
+  提取: preferences, missing_constraints, workflow_patterns
+  ↓
+  更新 UserProfileStore（新增偏好、工作流）
+  ↓
+  为遗漏约束生成 Hypothesis（待确认假设）
+```
+
+**/evolve 命令**：
+- 综合分析整个会话历史
+- 批量更新用户画像
+- 适用于深度分析场景
+
 ### 2.5 MCP Server (server.py)
 
 FastMCP 实现的工具服务端，提供 5 个销售数据工具：
@@ -204,7 +278,9 @@ FastMCP 实现的工具服务端，提供 5 个销售数据工具：
 ```
 用户输入
     ↓
-[AgentCore] 检索相关记忆 → 注入 system prompt
+[AgentCore] 检索相关记忆（向量+画像）→ 注入 system prompt
+    ↓
+[AgentCore] 检查待确认假设 → 触发提示（如果匹配）
     ↓
 [AgentCore] 技能匹配 → 加载完整 SKILL.md（如果匹配）
     ↓
@@ -216,7 +292,7 @@ FastMCP 实现的工具服务端，提供 5 个销售数据工具：
     ↓
 是否需要工具调用?
     ├── 是 → [MCP Server] 执行工具 → 返回结果 → 继续对话循环
-    └── 否 → 记录回复 → 等待下一轮输入
+    └── 否 → 记录回复 → [EvolutionEngine] 后台进化观察 → 等待下一轮输入
 ```
 
 ### 3.2 工具调用链流程
@@ -374,11 +450,12 @@ uv run agent.py
 - **响应速度**：启动时仅加载摘要（~100 tokens）
 - **按需加载**：匹配后才加载完整指令和脚本
 
-### 7.3 为什么设计双层记忆系统？
+### 7.3 为什么设计三层记忆系统？
 
 - **向量记忆**：支持语义检索，跨会话关联相关内容
 - **SQLite 记录**：精确回溯，支持工具调用链分析
-- **互补**：向量记忆用于"联想"，SQLite 用于"精确还原"
+- **进化式记忆**：用户画像 + 假设队列，Agent 自我进化
+- **互补**：向量记忆用于"联想"，SQLite 用于"精确还原"，进化式记忆用于"个性化"
 
 ---
 
@@ -397,10 +474,16 @@ uv run agent.py
 │   │   ├── qwen.py             # 通义千问后端
 │   │   ├── glm.py              # 智谱 GLM 后端
 │   │   └── ollama.py           # Ollama 后端
-│   └── commands/
+│   ├── commands/
+│   │   ├── __init__.py
+│   │   ├── memory.py           # /memory 命令
+│   │   └── history.py          # /history 命令
+│   └── evolution/
 │       ├── __init__.py
-│       ├── memory.py           # /memory 命令
-│       └── history.py          # /history 命令
+│       ├── engine.py           # 进化引擎
+│       ├── observer.py         # 观察者
+│       ├── profile.py          # 用户画像存储
+│       └── hypothesis.py      # 假设管理
 ├── server.py                   # MCP Server
 ├── memory_store.py             # 向量记忆模块
 ├── conversation_store.py       # 会话记录模块
@@ -415,7 +498,8 @@ uv run agent.py
 ├── object_db/                  # 数据库存储
 │   ├── sales.db
 │   ├── memory_db/
-│   └── conversations.db
+│   ├── conversations.db
+│   └── user_profile.db        # 用户画像与假设
 ├── pyproject.toml              # 项目配置
 ├── README.md
 └── docs/
@@ -428,20 +512,38 @@ uv run agent.py
 
 ### 9.1 斜杠命令列表
 
+#### 记忆管理
 | 命令 | 说明 |
 |------|------|
-| `/new` | 创建新会话 |
 | `/memory list` | 列出最近 10 条记忆 |
 | `/memory search <关键词>` | 语义搜索记忆 |
 | `/memory delete <ID>` | 删除指定记忆 |
 | `/memory clear` | 清空所有记忆 |
 | `/memory stats` | 查看记忆统计 |
+
+#### 会话管理
+| 命令 | 说明 |
+|------|------|
+| `/new` | 创建新会话 |
 | `/history` | 列出最近会话 |
 | `/history show <ID>` | 查看会话详情 |
 | `/history resume <ID>` | 恢复历史会话 |
 | `/history delete <ID>` | 删除指定会话 |
 | `/history clear` | 清空所有会话 |
 | `/history stats` | 查看会话统计 |
+
+#### 用户画像进化
+| 命令 | 说明 |
+|------|------|
+| `/evolve` | 主动总结归纳（深度分析用户画像） |
+| `/profile` | 查看当前用户画像 |
+| `/profile clear` | 清空用户画像 |
+| `/hypothesis` | 查看待确认假设 |
+| `/hypothesis clear` | 清空所有假设 |
+
+#### 其他
+| 命令 | 说明 |
+|------|------|
 | `/help` | 显示帮助 |
 | `/exit` | 退出程序 |
 
